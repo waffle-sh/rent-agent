@@ -13,11 +13,13 @@ from datetime import date
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
+from xml.parsers.expat import ExpatError
 
 import httpx
 import xmltodict
 
 FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures"
+MAX_PAGES = 20  # 안전장치: 1,000건 × 20페이지. 서울 자치구 한 달 전월세는 최대 수천 건.
 
 
 class HousingType(StrEnum):
@@ -85,12 +87,31 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _to_date(item: dict) -> date:
+    try:
+        return date(
+            _to_int(item.get("dealYear")),
+            _to_int(item.get("dealMonth")),
+            _to_int(item.get("dealDay")),
+        )
+    except ValueError as e:
+        raise MolitApiError(
+            "거래일 필드 오류: "
+            f"{item.get('dealYear')}-{item.get('dealMonth')}-{item.get('dealDay')}"
+        ) from e
+
+
 def parse_rent_xml(xml_text: str, housing_type: HousingType) -> tuple[list[RentRecord], int]:
-    """XML → (레코드 목록, totalCount). 공공데이터포털 공통 에러 포맷은 예외로 변환."""
-    data = xmltodict.parse(xml_text)
+    """XML → (레코드 목록, totalCount). 모든 실패는 MolitApiError로 통일한다."""
+    try:
+        data = xmltodict.parse(xml_text)
+    except ExpatError as e:
+        raise MolitApiError(f"XML 파싱 실패: {e}") from e
     if "OpenAPI_ServiceResponse" in data:
         header = data["OpenAPI_ServiceResponse"].get("cmmMsgHeader", {})
         raise MolitApiError(f"{header.get('errMsg')}: {header.get('returnAuthMsg')}")
+    if "response" not in data:
+        raise MolitApiError(f"알 수 없는 응답 형식: 루트={list(data)[:1]}")
 
     response = data["response"]
     result_code = _clean(response.get("header", {}).get("resultCode"))
@@ -114,11 +135,7 @@ def parse_rent_xml(xml_text: str, housing_type: HousingType) -> tuple[list[RentR
             area_m2=_to_float(it.get("excluUseAr")),
             floor=_to_int(it.get("floor")),
             build_year=_to_int(it.get("buildYear")),
-            deal_date=date(
-                _to_int(it.get("dealYear")),
-                _to_int(it.get("dealMonth")),
-                _to_int(it.get("dealDay")),
-            ),
+            deal_date=_to_date(it),
             deposit=_to_int(it.get("deposit")),
             monthly_rent=_to_int(it.get("monthlyRent")),
             contract_type=_clean(it.get("contractType")),
@@ -154,25 +171,42 @@ class MolitRentClient:
         housing_type: HousingType = HousingType.APARTMENT,
         num_of_rows: int = 1000,
     ) -> list[RentRecord]:
+        """해당 월 전체를 가져온다. totalCount가 numOfRows를 넘으면 페이지를 이어서 요청한다
+        (강남구 아파트 한 달 1,265건처럼 1,000건 상한을 넘는 경우 중위값이 달라지므로 필수)."""
         endpoint = self._endpoints.get(housing_type)
         if not endpoint:
             raise MolitApiError(f"{housing_type.value} 유형의 엔드포인트가 설정되지 않았습니다")
+        url = f"{endpoint}/{HOUSING_SPECS[housing_type].operation}"
+        records: list[RentRecord] = []
+        for page_no in range(1, MAX_PAGES + 1):
+            page, total = self._get_page(url, lawd_cd, deal_ymd, page_no, num_of_rows, housing_type)
+            records.extend(page)
+            if not page or len(records) >= total:
+                break
+        return records
+
+    def _get_page(
+        self,
+        url: str,
+        lawd_cd: str,
+        deal_ymd: str,
+        page_no: int,
+        num_of_rows: int,
+        housing_type: HousingType,
+    ) -> tuple[list[RentRecord], int]:
         params = {
             "serviceKey": self._key,
             "LAWD_CD": lawd_cd,
             "DEAL_YMD": deal_ymd,
-            "pageNo": 1,
+            "pageNo": page_no,
             "numOfRows": num_of_rows,
         }
         try:
-            resp = self._http.get(
-                f"{endpoint}/{HOUSING_SPECS[housing_type].operation}", params=params
-            )
+            resp = self._http.get(url, params=params)
             resp.raise_for_status()
         except httpx.HTTPError as e:
             raise MolitApiError(f"HTTP 오류: {e}") from e
-        records, _ = parse_rent_xml(resp.text, housing_type)
-        return records
+        return parse_rent_xml(resp.text, housing_type)
 
 
 class MockMolitRentClient:

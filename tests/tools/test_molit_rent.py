@@ -92,11 +92,97 @@ def test_parse_empty_items():
     assert records == [] and total == 0
 
 
+def _response(items_xml: str, total: int) -> str:
+    return (
+        "<response><header><resultCode>000</resultCode><resultMsg>OK</resultMsg></header>"
+        f"<body><items>{items_xml}</items><numOfRows>1000</numOfRows><pageNo>1</pageNo>"
+        f"<totalCount>{total}</totalCount></body></response>"
+    )
+
+
+def _item(name: str = "A", day: str = "1", deposit: str = "10,000") -> str:
+    return (
+        f"<item><aptNm>{name}</aptNm><buildYear>2000</buildYear><dealYear>2026</dealYear>"
+        f"<dealMonth>7</dealMonth><dealDay>{day}</dealDay><deposit>{deposit}</deposit>"
+        "<monthlyRent>0</monthlyRent><excluUseAr>59.9</excluUseAr>"
+        "<floor>3</floor><umdNm>역삼동</umdNm></item>"
+    )
+
+
+def test_parse_single_item_dict():
+    # 결과가 1건이면 xmltodict가 list 대신 dict를 준다
+    records, total = parse_rent_xml(_response(_item(), 1), HousingType.APARTMENT)
+    assert total == 1 and len(records) == 1 and records[0].building_name == "A"
+
+
+def test_parse_result_code_error_raises():
+    xml = (
+        "<response><header><resultCode>99</resultCode>"
+        "<resultMsg>LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS</resultMsg>"
+        "</header><body/></response>"
+    )
+    with pytest.raises(MolitApiError, match="resultCode=99"):
+        parse_rent_xml(xml, HousingType.APARTMENT)
+
+
+def test_parse_invalid_date_raises_molit_error():
+    with pytest.raises(MolitApiError, match="거래일"):
+        parse_rent_xml(_response(_item(day=" "), 1), HousingType.APARTMENT)
+
+
+def test_parse_non_xml_raises_molit_error():
+    with pytest.raises(MolitApiError):
+        parse_rent_xml("<html><body>Bad Gateway</body></html>", HousingType.APARTMENT)
+    with pytest.raises(MolitApiError):
+        parse_rent_xml("not xml at all", HousingType.APARTMENT)
+
+
+def test_client_paginates_until_total_count():
+    # 총 3건, 페이지당 2건 → 2페이지 요청. 강남구 아파트는 한 달 1,265건으로 1,000건 상한을 넘는다.
+    pages = {
+        "1": _response(_item("A", "1") + _item("B", "2"), 3),
+        "2": _response(_item("C", "3"), 3),
+    }
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page_no = request.url.params["pageNo"]
+        seen.append(page_no)
+        return httpx.Response(200, text=pages[page_no])
+
+    client = MolitRentClient(
+        ENDPOINTS, service_key="k", http=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    records = client.fetch("11680", "202607", num_of_rows=2)
+    assert [r.building_name for r in records] == ["A", "B", "C"]
+    assert seen == ["1", "2"]
+
+
+def test_client_stops_on_empty_page_even_if_total_larger():
+    # totalCount가 잘못 크게 와도 빈 페이지에서 멈춘다 (무한 루프 방지)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        body = _response(_item("A"), 999) if calls == 1 else _response("", 999)
+        return httpx.Response(200, text=body)
+
+    client = MolitRentClient(
+        ENDPOINTS, service_key="k", http=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    assert len(client.fetch("11680", "202607", num_of_rows=1)) == 1
+    assert calls == 2
+
+
 def test_client_sends_decoded_key_once_and_uses_operation_per_type():
     captured: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(str(request.url))
+        # 픽스처 totalCount는 실제값(1,265)이라 2페이지째는 비운다
+        if request.url.params["pageNo"] != "1":
+            return httpx.Response(200, text=_response("", 1265))
         body = "rent_response_rh.xml" if "RHRent" in str(request.url) else "rent_response.xml"
         return httpx.Response(200, text=_xml(body))
 
@@ -111,10 +197,11 @@ def test_client_sends_decoded_key_once_and_uses_operation_per_type():
 
     assert len(apt) == 4 and apt[0].housing_type == HousingType.APARTMENT
     assert len(rh) == 4 and rh[0].housing_type == HousingType.MULTI_HOUSE
+    # 호출 순서: apt p1, apt p2(빈 페이지), rh p1, rh p2(빈 페이지)
     assert captured[0].startswith(
         "https://apis.data.go.kr/1613000/RTMSDataSvcAptRent/getRTMSDataSvcAptRent?"
     )
-    assert captured[1].startswith(
+    assert captured[2].startswith(
         "https://apis.data.go.kr/1613000/RTMSDataSvcRHRent/getRTMSDataSvcRHRent?"
     )
     # httpx가 한 번만 인코딩: '+' → %2B, '=' → %3D
