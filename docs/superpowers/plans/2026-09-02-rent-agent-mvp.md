@@ -2931,6 +2931,9 @@ from rent_agent.agents.prompts import KNOWLEDGE_PROMPT
 from rent_agent.config import Settings
 from rent_agent.rag.retriever import get_retriever
 
+# 도구 출력에서 문단을 구분하는 구분자. 평가 스크립트가 ToolMessage를 다시 문단으로 나눌 때도 사용.
+CONTEXT_SEPARATOR = "\n\n---\n\n"
+
 
 def make_knowledge_tool(retriever: BaseRetriever) -> BaseTool:
     @tool
@@ -2940,7 +2943,7 @@ def make_knowledge_tool(retriever: BaseRetriever) -> BaseTool:
         docs = retriever.invoke(query)
         if not docs:
             return "관련 문서를 찾지 못했습니다."
-        return "\n\n---\n\n".join(
+        return CONTEXT_SEPARATOR.join(
             f"[출처: {d.metadata.get('title', '')} | {d.metadata.get('source', '')} | "
             f"기준일 {d.metadata.get('effective_date', '')}]\n{d.page_content}"
             for d in docs
@@ -3714,7 +3717,13 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 `scripts/eval_rag.py`:
 ```python
 """RAGAS로 지식 QA(RAG) 품질 평가. 실행: uv run python scripts/eval_rag.py
-지표: faithfulness, answer_relevancy, context_precision. 결과는 eval/results/<날짜>.json + .md"""
+
+지표: faithfulness, answer_relevancy, context_precision.
+- faithfulness의 컨텍스트는 **에이전트가 실제로 도구 호출로 본 문서**(ToolMessage 원문)를 쓴다.
+  스크립트가 질문으로 직접 검색한 결과와 다를 수 있기 때문(에이전트는 질의를 바꿔 여러 번 검색할 수 있음).
+- context_precision은 리트리버 자체의 품질이므로 원 질문으로 검색한 결과를 쓴다.
+결과: eval/results/<날짜>.md(최신), eval/results/history.md(실행 이력 1행 추가), eval/results/<타임스탬프>.json(gitignore).
+"""
 
 import asyncio
 import json
@@ -3722,18 +3731,30 @@ from datetime import datetime
 from pathlib import Path
 from statistics import mean
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from openai import AsyncOpenAI
 from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
 from ragas.llms import llm_factory
 from ragas.metrics.collections import AnswerRelevancy, ContextPrecision, Faithfulness
 
-from rent_agent.agents.knowledge_agent import build_knowledge_agent
+from rent_agent.agents.knowledge_agent import CONTEXT_SEPARATOR, build_knowledge_agent
 from rent_agent.agents.llm import configure_tracing
 from rent_agent.config import get_settings
 from rent_agent.rag.retriever import get_retriever
 
 ROOT = Path(__file__).resolve().parents[1]
+METRICS = ("faithfulness", "answer_relevancy", "context_precision")
+
+
+def agent_contexts(messages) -> list[str]:
+    """에이전트가 search_real_estate_knowledge 로 실제로 받은 문단들(중복 제거, 순서 유지)."""
+    seen: dict[str, None] = {}
+    for m in messages:
+        if isinstance(m, ToolMessage) and m.name == "search_real_estate_knowledge":
+            for chunk in str(m.content).split(CONTEXT_SEPARATOR):
+                if chunk.strip():
+                    seen.setdefault(chunk.strip(), None)
+    return list(seen)
 
 
 async def main() -> None:
@@ -3746,28 +3767,77 @@ async def main() -> None:
     # 기본 max_tokens=1024는 한국어 법령 청크의 NLI 판정 JSON이 잘려 IncompleteOutputException (실측)
     judge = llm_factory(settings.openai_model, client=client, max_tokens=4096)
     emb = RagasOpenAIEmbeddings(client=client, model=settings.openai_embedding_model)
-    faith, relev, prec = Faithfulness(llm=judge), AnswerRelevancy(llm=judge, embeddings=emb), ContextPrecision(llm=judge)
+    faith = Faithfulness(llm=judge)
+    relev = AnswerRelevancy(llm=judge, embeddings=emb)
+    prec = ContextPrecision(llm=judge)
 
-    rows = [json.loads(line) for line in (ROOT / "eval" / "dataset.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows = [
+        json.loads(line)
+        for line in (ROOT / "eval" / "dataset.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     results = []
     for row in rows:
-        contexts = [d.page_content for d in retriever.invoke(row["question"])]
-        answer = agent.invoke({"messages": [HumanMessage(row["question"])]})["messages"][-1].content
-        f = await faith.ascore(user_input=row["question"], response=answer, retrieved_contexts=contexts)
-        r = await relev.ascore(user_input=row["question"], response=answer)
-        p = await prec.ascore(user_input=row["question"], reference=row["reference"], retrieved_contexts=contexts)
-        results.append({**row, "answer": answer, "faithfulness": f.value, "answer_relevancy": r.value, "context_precision": p.value})
-        print(f"[{len(results)}/{len(rows)}] F={f.value:.2f} R={r.value:.2f} P={p.value:.2f}  {row['question']}")
+        q = row["question"]
+        result = agent.invoke({"messages": [HumanMessage(q)]})
+        answer = result["messages"][-1].content
+        seen_contexts = agent_contexts(result["messages"]) or [d.page_content for d in retriever.invoke(q)]
+        retriever_contexts = [d.page_content for d in retriever.invoke(q)]
+        f = await faith.ascore(user_input=q, response=answer, retrieved_contexts=seen_contexts)
+        r = await relev.ascore(user_input=q, response=answer)
+        p = await prec.ascore(user_input=q, reference=row["reference"], retrieved_contexts=retriever_contexts)
+        results.append(
+            {
+                **row,
+                "answer": answer,
+                "agent_contexts": seen_contexts,
+                "faithfulness": f.value,
+                "answer_relevancy": r.value,
+                "context_precision": p.value,
+            }
+        )
+        print(f"[{len(results)}/{len(rows)}] F={f.value:.2f} R={r.value:.2f} P={p.value:.2f}  {q}")
 
-    summary = {k: round(mean(x[k] for x in results), 3) for k in ("faithfulness", "answer_relevancy", "context_precision")}
-    stamp = datetime.now().strftime("%Y-%m-%d")
+    summary = {k: round(mean(x[k] for x in results), 3) for k in METRICS}
+    now = datetime.now()
     out_dir = ROOT / "eval" / "results"
-    (out_dir / f"{stamp}.json").write_text(json.dumps({"summary": summary, "rows": results}, ensure_ascii=False, indent=2), encoding="utf-8")
-    md = [f"# RAG 평가 결과 {stamp}", "", f"모델: {settings.openai_model} / 임베딩: {settings.openai_embedding_model} / k={settings.retriever_k}", "",
-          "| 지표 | 평균 |", "|---|---|", *[f"| {k} | {v} |" for k, v in summary.items()], "",
-          "| 질문 | F | R | P |", "|---|---|---|---|",
-          *[f"| {x['question']} | {x['faithfulness']:.2f} | {x['answer_relevancy']:.2f} | {x['context_precision']:.2f} |" for x in results]]
-    (out_dir / f"{stamp}.md").write_text("\n".join(md), encoding="utf-8")
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / f"{now:%Y-%m-%d_%H%M}.json").write_text(
+        json.dumps({"summary": summary, "rows": results}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    config_line = (
+        f"모델: {settings.openai_model} / 임베딩: {settings.openai_embedding_model} / k={settings.retriever_k} "
+        f"/ n={len(rows)} / faithfulness 컨텍스트=에이전트 ToolMessage"
+    )
+    md = [
+        f"# RAG 평가 결과 {now:%Y-%m-%d}",
+        "",
+        config_line,
+        "",
+        "| 지표 | 평균 |",
+        "|---|---|",
+        *[f"| {k} | {v} |" for k, v in summary.items()],
+        "",
+        "| 질문 | F | R | P |",
+        "|---|---|---|---|",
+        *[
+            f"| {x['question']} | {x['faithfulness']:.2f} | {x['answer_relevancy']:.2f} | {x['context_precision']:.2f} |"
+            for x in results
+        ],
+        "",
+    ]
+    (out_dir / f"{now:%Y-%m-%d}.md").write_text("\n".join(md), encoding="utf-8")
+
+    history = out_dir / "history.md"
+    if not history.exists():
+        history.write_text(
+            "# RAG 평가 실행 이력\n\n| 실행 시각 | F | R | P | 설정 |\n|---|---|---|---|---|\n", encoding="utf-8"
+        )
+    with history.open("a", encoding="utf-8") as fh:
+        fh.write(
+            f"| {now:%Y-%m-%d %H:%M} | {summary['faithfulness']} | {summary['answer_relevancy']} "
+            f"| {summary['context_precision']} | {config_line} |\n"
+        )
     print("\n요약:", summary)
 
 
@@ -3808,7 +3878,15 @@ KNOWLEDGE_PROMPT(Task 9 블록)에 "각 조건을 해당 상품에만 귀속" �
 1. `rag/ingest.py`의 `split_documents` 기본 `chunk_size`를 800 → **1000**(`DEFAULT_CHUNK_SIZE`, Task 8 블록 반영). 가장 긴 섹션이 ≈950자라 모든 `##` 섹션이 한 청크가 된다.
 2. `tests/rag/test_ingest.py::test_real_corpus_chunking_is_stable`에 "(file, section) 중복 없음" 단언 추가(Task 8 블록 반영) — 섹션 분할 회귀 방지.
 3. 재적재 → 5차 평가. Q9 컨텍스트에 섹션 ② 본문(병역 예외 포함)이 들어오는지 확인.
-**5차(최종) 결과: F 0.914 / R 0.391 / P 0.886 (k=6), 53 청크.** Q9 F 0.57→0.71, 답이 섹션 ② 본문("복무기간 차감") 근거로 생성됨. P는 같은 k=6인 4차 대비 0.832→0.886 상승(전체 섹션이 조각 청크를 대체). README에는 최종(5차) 수치와 1→5차 변화·해석을 기록한다. n=10이라 ±0.05는 판정 변동 범위임을 명시. P는 k 변경 전후를 비교하지 않는다.
+**5차(최종) 결과: F 0.914 / R 0.391 / P 0.886 (k=6), 53 청크.** Q9 F 0.57→0.71, 답이 섹션 ② 본문("복무기간 차감") 근거로 생성됨. P는 같은 k=6인 4차 대비 0.832→0.886 상승(전체 섹션이 조각 청크를 대체). README에는 최종 수치와 1→최종 변화·해석을 기록한다.
+
+- [ ] **Step 3f: faithfulness 컨텍스트를 에이전트의 실제 도구 출력으로 (Task 14 리뷰) + 최종 평가**
+리뷰 지적: 스크립트가 `retriever.invoke(question)`으로 얻은 컨텍스트와 에이전트가 도구 호출로 실제 본 컨텍스트(질의를 바꿔 여러 번 검색 가능)가 다를 수 있어, 근거 있는 답이 환각으로 판정되거나 반대가 될 수 있다. 3~4차의 "섹션 ② 미포함" 진단도 스크립트 검색 기준이었다.
+1. `knowledge_agent.py`에 `CONTEXT_SEPARATOR = "\n\n---\n\n"` 상수를 두고 도구가 그것으로 문단을 이어붙인다(기존 리터럴 대체).
+2. `scripts/eval_rag.py`를 위 블록으로 교체: `agent_contexts()`가 ToolMessage 원문을 분리기로 나눠 faithfulness 컨텍스트로 쓰고(도구 미호출 시 리트리버 결과로 대체), context_precision은 원 질문 검색 결과 유지. json은 타임스탬프 파일명, `history.md`에 1행 추가.
+3. `config.py` 주석 "54청크" → "53청크"; `tests/rag/test_ingest.py` 길이 상한을 `len(c.page_content) - len(f"[{c.metadata['title']}] ") <= 1000`으로.
+4. 6차(최종) 실행 → README는 이 결과를 인용한다. `history.md`도 커밋.
+**README에 명시할 평가 한계:** n=10, 문서 작성자가 만든 질문(독립 평가셋 아님); 단일 실행, 판정 변동 ≈ ±0.05; 판정 모델 = 에이전트 모델(자기 선호 위험); P는 k·청크 크기 변경 전후 비교 불가; answer_relevancy는 한국어+small 임베딩에서 절대값 의미 약함; 질문 2건이 코퍼스 어휘 보강(사실 불변)을, 1건이 reference 수정을 유발함(테스트셋 튜닝 공개). n=10이라 ±0.05는 판정 변동 범위임을 명시. P는 k 변경 전후를 비교하지 않는다.
 
 - [ ] **Step 4: 커밋 (md 결과 포함, json은 gitignore)**
 
