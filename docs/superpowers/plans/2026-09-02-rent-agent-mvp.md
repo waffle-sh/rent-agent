@@ -2315,7 +2315,7 @@ SUPERVISOR_PROMPT = """당신은 사회초년생·무주택자를 돕는 부동�
    지역/단지 정보가 있으면 market_agent 도 호출해 시세 비교를 얻습니다.
    판단에 필요한 제도(소액임차인, 보증보험 등) 설명이 필요하면 knowledge_agent 도 호출합니다.
    마지막에 report_agent 를 호출해 종합 리포트를 만들게 하고, 그 리포트를 최종 답변으로 사용합니다.
-3. 지역·건물의 전세 시세만 묻는 요청(보증금·매매 시세 없음) → market_agent 만 호출하고 결과를 전달합니다.
+3. 시세(비교)만 묻는 요청(매매 시세 없음; "이 보증금이 시세 대비 어떤가요" 포함) → market_agent 만 호출하고 결과를 전달합니다. 보증금이 있으면 deposit 으로 넘기게 합니다.
 4. 진단 요청인데 필수 정보(보증금, 매매 시세)가 없으면 에이전트를 호출하지 말고 무엇이 필요한지 물어봅니다.
 5. 같은 에이전트를 같은 입력으로 두 번 호출하지 않습니다.
 항상 한국어로 답합니다."""
@@ -2335,6 +2335,7 @@ MARKET_PROMPT = """당신은 전세 실거래가 조회 담당자입니다. 국�
 4. 사용자의 보증금이 대화에 있으면 get_recent_jeonse_deals 에 deposit 으로 넘겨 ratio_to_reference 를 받습니다(직접 계산 금지).
    기준값(reference_median)은 도구가 정합니다: 신규 계약 3건 이상이면 신규 중위값, 아니면 전체 중위값(갱신 포함). 갱신 계약은 증액 상한 5% 때문에 2년 전 가격이라 시세가 아닙니다.
 5. 결과는 주거 유형, 거래 건수(전체/신규), 기준 중위값과 그 근거, 최소/최대, 최근 거래 5건, 데이터 한계(건물명 표기 차이 가능, 신축·비등록 건물 누락 가능)를 포함해 간결히 보고합니다.
+   결과에 errors 가 있으면 해당 월 데이터를 가져오지 못했음을 명시합니다.
 숫자 단위는 '만원'입니다. 추측으로 시세를 만들지 않습니다. 한국어로 답합니다."""
 
 RISK_PROMPT = """당신은 전세 위험 판단 담당자입니다.
@@ -2569,8 +2570,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 import json
 from datetime import date
 
-from rent_agent.agents.market_agent import make_market_tools, recent_deal_months
-from rent_agent.tools.molit_rent import MockMolitRentClient
+from rent_agent.agents.market_agent import make_market_tools, recent_deal_months, small_tenant_region
+from rent_agent.tools.molit_rent import HousingType, MockMolitRentClient, MolitApiError
 
 
 def test_recent_deal_months():
@@ -2631,10 +2632,68 @@ def test_get_recent_jeonse_deals_officetel_no_jeonse():
     assert out["count"] == 0 and "message" in out
 
 
-def test_get_recent_jeonse_deals_invalid_housing_type():
+def test_housing_type_is_an_enum_in_tool_schema():
     _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
-    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "housing_type": "villa"}))
-    assert "error" in out and "multi_house" in out["error"]
+    props = get_recent_jeonse_deals.args_schema.model_json_schema()["properties"]
+    assert props["housing_type"]["enum"] == ["apartment", "multi_house", "officetel"]
+
+
+def test_months_is_clamped_and_errors_are_reported():
+    class FlakyClient:
+        calls: list[str] = []
+
+        def fetch(self, lawd_cd, deal_ymd, housing_type=HousingType.APARTMENT, num_of_rows=1000):
+            self.calls.append(deal_ymd)
+            if deal_ymd.endswith("08"):
+                raise MolitApiError("LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS")
+            return MockMolitRentClient().fetch(lawd_cd, deal_ymd, housing_type)
+
+    client = FlakyClient()
+    _, get_recent_jeonse_deals = make_market_tools(client)
+    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "months": 24}))
+    assert len(out["months_queried"]) == 12  # 24 → 12로 클램프
+    assert len(client.calls) == 12
+    assert any(e.endswith("08: LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS") for e in out["errors"])
+    assert out["count"] > 0  # 실패한 달을 제외한 나머지는 요약됨
+
+    out0 = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "months": 0}))
+    assert len(out0["months_queried"]) == 1  # 0 → 1
+
+
+def test_reference_uses_new_contract_median_at_exactly_three():
+    from datetime import date as _date
+
+    from rent_agent.tools.molit_rent import RentRecord
+
+    def rec(deposit, contract):
+        return RentRecord(
+            housing_type=HousingType.APARTMENT, building_name="X", sub_type="", dong="d", area_m2=59.9, floor=1,
+            build_year=2000, deal_date=_date(2026, 7, 1), deposit=deposit, monthly_rent=0,
+            contract_type=contract, renewal_right_used=contract == "갱신",
+        )
+
+    class StaticClient:
+        def fetch(self, lawd_cd, deal_ymd, housing_type=HousingType.APARTMENT, num_of_rows=1000):
+            return [rec(50000, "신규"), rec(52000, "신규"), rec(54000, ""), rec(40000, "갱신")]
+
+    _, get_recent_jeonse_deals = make_market_tools(StaticClient())
+    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "months": 1, "deposit": 52000}))
+    assert out["new_contract_count"] == 3
+    assert out["reference_basis"] == "신규 계약 중위값" and out["reference_median"] == 52000
+    assert out["ratio_to_reference"] == 100.0
+
+
+def test_small_tenant_region_allowlist_covers_every_code():
+    # 정적 함수(서울→seoul, 그 외→metro_over)가 유효한 범위를 데이터로 고정. 코드표에 파주·인천 등을 추가하면 이 테스트가 먼저 깨진다.
+    from rent_agent.tools.lawd_code import LAWD_CODES
+
+    metro_over_cities = ("수원시", "성남시", "고양시", "용인시", "부천시", "안양시", "화성시", "하남시", "광명시", "과천시")
+    for name in LAWD_CODES:
+        if name.startswith("서울"):
+            assert small_tenant_region(name) == "seoul"
+        else:
+            assert any(city in name for city in metro_over_cities), name
+            assert small_tenant_region(name) == "metro_over"
 ```
 
 - [ ] **Step 2: 실패 확인**
@@ -2651,6 +2710,7 @@ Expected: FAIL — ModuleNotFoundError
 import json
 from dataclasses import asdict
 from datetime import date
+from typing import Literal
 
 from langchain.agents import create_agent
 from langchain_core.tools import BaseTool, tool
@@ -2670,6 +2730,7 @@ from rent_agent.tools.molit_rent import (
 
 
 MIN_NEW_CONTRACTS = 3  # 신규 계약이 이 건수 이상이면 신규 중위값을 시세 기준으로 쓴다
+MIN_MONTHS, MAX_MONTHS = 1, 12  # 조회 개월 수 클램프. 12개월 × 최대 2페이지면 충분하고 그 이상은 "현재 시세"가 아니다
 
 
 def small_tenant_region(region_name: str) -> str:
@@ -2708,7 +2769,7 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
     @tool
     def get_recent_jeonse_deals(
         lawd_cd: str,
-        housing_type: str = "apartment",
+        housing_type: Literal["apartment", "multi_house", "officetel"] = "apartment",
         building_name: str | None = None,
         area_m2: float | None = None,
         months: int = 3,
@@ -2721,11 +2782,8 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
         반환 JSON: housing_type, count, median_deposit(전체), new_contract_count, new_contract_median(갱신 제외),
         reference_median·reference_basis(도구가 정한 시세 기준값: 신규 3건 이상이면 신규 중위값, 아니면 전체),
         ratio_to_reference(deposit ÷ reference_median × 100, deposit이 있을 때만), min/max_deposit(만원), recent(최근 5건), months_queried."""
-        try:
-            htype = HousingType(housing_type)
-        except ValueError:
-            valid = ", ".join(t.value for t in HousingType)
-            return json.dumps({"error": f"housing_type은 다음 중 하나여야 합니다: {valid}"}, ensure_ascii=False)
+        htype = HousingType(housing_type)  # Literal이 스키마에서 이미 검증 — 잘못된 값은 LLM에 오류 ToolMessage로 돌아감
+        months = max(MIN_MONTHS, min(months, MAX_MONTHS))  # 0/음수 방지, 과다 API 호출 방지
 
         records = []
         errors: list[str] = []
