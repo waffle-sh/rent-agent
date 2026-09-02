@@ -9,13 +9,6 @@ from rent_agent.tools.molit_rent import HousingType, MolitRentClient
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture(autouse=True)
-def _use_real_service_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """conftest의 autouse 픽스처가 넣어 둔 더미 키를 지운다.
-    pydantic-settings는 환경변수를 .env보다 우선하므로, 지우지 않으면 실제 키가 무시된다."""
-    monkeypatch.delenv("APARTMENT_OPENAPI_KEY", raising=False)
-
-
 @pytest.mark.parametrize("name,code", list(LAWD_CODES.items()))
 def test_every_code_returns_apartment_rent_data(name, code):
     s = Settings(_env_file=PROJECT_ROOT / ".env")
