@@ -2310,11 +2310,12 @@ SUPERVISOR_PROMPT = """당신은 사회초년생·무주택자를 돕는 부동�
 - report_agent: 앞 에이전트들의 결과를 종합해 사용자용 최종 리포트를 작성합니다.
 
 위임 규칙:
-1. 단순 지식 질문 → knowledge_agent 만 호출하고 그 답을 그대로 전달합니다.
+1. 단순 지식 질문 → knowledge_agent 만 호출한 뒤, forward_message(from_agent="knowledge_agent") 로 그 답을 **그대로** 전달합니다.
 2. 전세 매물 진단 요청(보증금·시세 등 숫자가 있음) → risk_agent 호출.
    지역/단지 정보가 있으면 market_agent 도 호출해 시세 비교를 얻습니다.
    판단에 필요한 제도(소액임차인, 보증보험 등) 설명이 필요하면 knowledge_agent 도 호출합니다.
-   마지막에 report_agent 를 호출해 종합 리포트를 만들게 하고, 그 리포트를 최종 답변으로 사용합니다.
+   마지막에 report_agent 를 호출해 종합 리포트를 만들게 하고, forward_message(from_agent="report_agent") 로 리포트를 **한 글자도 바꾸지 않고** 최종 답변으로 전달합니다.
+   직접 요약하거나 다시 쓰지 않습니다 — 수치·헤더(## 종합 판정)·면책 문구가 유실됩니다.
 3. 시세(비교)만 묻는 요청(매매 시세 없음; "이 보증금이 시세 대비 어떤가요" 포함) → market_agent 만 호출하고 결과를 전달합니다. 보증금이 있으면 deposit 으로 넘기게 합니다.
 4. 진단 요청인데 필수 정보(보증금, 매매 시세)가 없으면 에이전트를 호출하지 말고 무엇이 필요한지 물어봅니다.
 5. 같은 에이전트를 같은 입력으로 두 번 호출하지 않습니다.
@@ -2865,6 +2866,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Create: `src/rent_agent/agents/knowledge_agent.py`, `src/rent_agent/agents/report_agent.py`, `src/rent_agent/agents/supervisor.py`
 - Modify: `src/rent_agent/agents/risk_agent.py` — 만원 단위 가드의 `max(...)`에 `senior_liens, senior_deposits, own_capital`도 포함 (Task 10 리뷰 nit; Task 10 블록 코드가 이미 그 형태)
+- Modify: `src/rent_agent/agents/prompts.py` — SUPERVISOR_PROMPT 규칙 1·2에 forward_message 사용 지시 (Task 9 블록이 원본)
 - Test: `tests/agents/test_knowledge_tool.py`, `tests/agents/test_graph_integration.py`
 
 - [ ] **Step 1: 실패 테스트 (지식 검색 도구는 Fake 임베딩으로)**
@@ -2886,7 +2888,7 @@ def test_search_tool_formats_sources(tmp_path: Path):
         "---\ntitle: 임대차법\nsource: https://law.go.kr\neffective_date: 2024-01-01\n---\n## 대항력\n전입신고 다음 날 효력.",
         encoding="utf-8",
     )
-    vs = build_vectorstore(raw, tmp_path / "chroma", DeterministicFakeEmbedding(size=32), "t", reset=True)
+    vs = build_vectorstore(raw, tmp_path / "chroma", DeterministicFakeEmbedding(size=32), "test_docs", reset=True)
     search = make_knowledge_tool(vs.as_retriever(search_kwargs={"k": 1}))
     out = search.invoke({"query": "대항력"})
     assert "[출처: 임대차법 | https://law.go.kr | 기준일 2024-01-01]" in out
@@ -2954,11 +2956,18 @@ def build_report_agent(settings: Settings):
 
 `src/rent_agent/agents/supervisor.py`:
 ```python
-"""Supervisor 그래프 조립. output_mode='full_history'인 이유: report_agent가 다른 에이전트의
-도구 결과(수치)를 직접 봐야 하고, UI에서 에이전트 호출 흐름을 그대로 보여 주기 위함."""
+"""Supervisor 그래프 조립.
+
+- output_mode='full_history': report_agent가 다른 에이전트의 도구 결과(수치)를 직접 봐야 하고,
+  UI에서 에이전트 호출 흐름을 그대로 보여 주기 위함.
+- forward_message 도구: 통합 테스트에서 supervisor가 report_agent의 리포트를 자기 말로 바꿔 쓰며
+  "## 종합 판정" 헤더를 유실하는 것이 관측됨(2026-09-02). 워커 메시지를 원문 그대로 사용자에게
+  전달하는 langgraph-supervisor 내장 도구로 해결한다. 프롬프트 지시만으로는 재작성 습관을 막지 못했다.
+"""
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph_supervisor import create_supervisor
+from langgraph_supervisor.handoff import create_forward_message_tool
 
 from rent_agent.agents.knowledge_agent import build_knowledge_agent
 from rent_agent.agents.llm import get_llm
@@ -2979,6 +2988,7 @@ def build_graph(settings: Settings, checkpointer: BaseCheckpointSaver | None = N
     workflow = create_supervisor(
         agents,
         model=get_llm(settings),
+        tools=[create_forward_message_tool("supervisor")],
         prompt=SUPERVISOR_PROMPT,
         output_mode="full_history",
         add_handoff_back_messages=True,
@@ -3039,15 +3049,16 @@ def test_jeonse_diagnosis_calls_risk_and_report(real_settings):
     called = _agents_called(result)
     assert {"risk_agent", "report_agent"} <= called
     final = result["messages"][-1].content
-    assert "종합 판정" in final
+    assert final.lstrip().startswith("## 종합 판정")  # forward_message로 리포트 원문이 그대로 전달됨
     assert "위험" in final  # 전세가율 75%, 총 부담률 95% → 위험
+    assert "법률·금융 자문이 아닙니다" in final
 ```
 
 Run: `uv run pytest tests/agents/test_knowledge_tool.py -v`
 Expected: 1 passed
 
 Run: `uv run pytest -m integration -v`
-Expected: 2 passed (약 1~2분, 소액 과금). LangSmith 프로젝트 `rent-agent`에 트레이스 생성 확인.
+Expected: 2 passed (약 1~2분, 소액 과금). LangSmith 프로젝트 `rent-agent`에 트레이스 생성 확인 — `.env`에 `LANGSMITH_TRACING=true`가 있어야 한다(`configure_tracing`은 이 값이 참일 때만 환경변수를 올린다).
 
 - [ ] **Step 5: 커밋**
 
