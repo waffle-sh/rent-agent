@@ -1,8 +1,16 @@
-"""Supervisor 그래프 조립. output_mode='full_history'인 이유: report_agent가 다른 에이전트의
-도구 결과(수치)를 직접 봐야 하고, UI에서 에이전트 호출 흐름을 그대로 보여 주기 위함."""
+"""Supervisor 그래프 조립.
+
+- output_mode='full_history': report_agent가 다른 에이전트의 도구 결과(수치)를 직접 봐야 하고,
+  UI에서 에이전트 호출 흐름을 그대로 보여 주기 위함.
+- forward_message 도구: 통합 테스트에서 supervisor가 report_agent의 리포트를 자기 말로 바꿔 쓰며
+  "## 종합 판정" 헤더를 유실하는 것이 관측됨(2026-09-02). 워커 메시지를 원문 그대로 사용자에게
+  전달하는 langgraph-supervisor 내장 도구로 해결한다.
+  프롬프트 지시만으로는 재작성 습관을 막지 못했다.
+"""
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph_supervisor import create_supervisor
+from langgraph_supervisor.handoff import create_forward_message_tool
 
 from rent_agent.agents.knowledge_agent import build_knowledge_agent
 from rent_agent.agents.llm import get_llm
@@ -23,6 +31,7 @@ def build_graph(settings: Settings, checkpointer: BaseCheckpointSaver | None = N
     workflow = create_supervisor(
         agents,
         model=get_llm(settings),
+        tools=[create_forward_message_tool("supervisor")],
         prompt=SUPERVISOR_PROMPT,
         output_mode="full_history",
         add_handoff_back_messages=True,
