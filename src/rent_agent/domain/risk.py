@@ -42,10 +42,17 @@ def expected_recovery(
     senior_liens: int,
     senior_deposits: int,
     deposit: int,
+    priority_amount: int = 0,
 ) -> tuple[int, int]:
-    """경매 시 (회수 가능액, 부족액). 낙찰가에서 선순위를 뺀 잔액이 내 보증금에 배당된다고 가정."""
+    """경매 시 (회수 가능액, 부족액).
+
+    배당 순서 가정: ① 소액임차인 최우선변제액(낙찰가의 1/2 한도) → ② 선순위 근저당·보증금
+    → ③ 내 보증금 잔여분. 낙찰가는 보수적으로 절사한다.
+    """
     proceeds = int(market_price * auction_ratio)
-    recovery = max(0, min(deposit, proceeds - senior_liens - senior_deposits))
+    priority = min(priority_amount, proceeds // 2)
+    remainder = max(0, proceeds - priority - senior_liens - senior_deposits)
+    recovery = min(deposit, priority + remainder)
     return recovery, deposit - recovery
 
 
@@ -71,17 +78,22 @@ def assess(inp: JeonseInput) -> RiskAssessment:
     burden = total_burden_ratio(
         inp.deposit, inp.senior_liens, inp.senior_deposits, inp.market_price
     )
-    recovery, shortfall = expected_recovery(
-        inp.market_price, inp.auction_ratio, inp.senior_liens, inp.senior_deposits, inp.deposit
-    )
     protected, priority_amount = small_tenant_protection(inp.region, inp.deposit)
+    recovery, shortfall = expected_recovery(
+        inp.market_price,
+        inp.auction_ratio,
+        inp.senior_liens,
+        inp.senior_deposits,
+        inp.deposit,
+        priority_amount=priority_amount,
+    )
     required_loan = max(0, inp.deposit - inp.own_capital)
     monthly_interest = required_loan * inp.loan_rate / 100 / 12
-    ratio_to_income = (
-        round(monthly_interest / (inp.annual_income / 12) * 100, 1)
-        if inp.annual_income
-        else None
+    # 비교는 반올림 전 값으로, 표시는 소수 1자리로 (30.04% → 표시 30.0, 경고는 발생)
+    ratio_raw = (
+        monthly_interest / (inp.annual_income / 12) * 100 if inp.annual_income else None
     )
+    ratio_to_income = round(ratio_raw, 1) if ratio_raw is not None else None
     level = classify(jr, burden, shortfall)
 
     reasons: list[str] = []
@@ -102,15 +114,18 @@ def assess(inp: JeonseInput) -> RiskAssessment:
     else:
         reasons.append(f"낙찰가율 {inp.auction_ratio:.0%} 가정 경매 시에도 보증금 전액 회수 가능")
     if protected:
-        reasons.append(f"소액임차인 최우선변제 대상: 최대 {priority_amount:,}만원 우선 변제")
+        reasons.append(
+            f"소액임차인 최우선변제 대상: 최대 {priority_amount:,}만원을 선순위 채권보다 "
+            "먼저 변제 (위 회수액 계산에 반영, 낙찰가의 1/2 한도)"
+        )
     else:
         reasons.append("보증금이 소액임차인 기준을 초과하여 최우선변제 대상 아님")
     if required_loan:
         reasons.append(
-            f"필요 대출 {required_loan:,}만원, 금리 {inp.loan_rate}% 기준 "
+            f"필요 대출 {required_loan:,}만원, 금리 {inp.loan_rate:g}% 기준 "
             f"월 이자 약 {monthly_interest:,.1f}만원"
         )
-    if ratio_to_income is not None and ratio_to_income > HOUSING_COST_INCOME_LIMIT:
+    if ratio_raw is not None and ratio_raw > HOUSING_COST_INCOME_LIMIT:
         reasons.append(
             f"월 이자가 월소득의 {ratio_to_income}%로 권고 상한 "
             f"{HOUSING_COST_INCOME_LIMIT:.0f}% 초과"

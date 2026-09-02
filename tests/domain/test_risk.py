@@ -38,6 +38,18 @@ def test_expected_recovery_no_shortfall_is_zero():
     assert shortfall == 0
 
 
+def test_expected_recovery_when_proceeds_below_seniors():
+    # 낙찰 8,000 < 선순위 9,000 → 회수 0, 전액 부족
+    assert expected_recovery(10000, 0.8, 9000, 0, 3000) == (0, 3000)
+
+
+def test_expected_recovery_priority_paid_before_liens():
+    # 서울 소액임차인: 보증금 5,000, 매매가 10,000, 근저당 7,000
+    # 낙찰 8,000 → 최우선변제 min(5,000, 8,000/2)=4,000 먼저 → 잔여 8,000-4,000-7,000<0 → 0
+    # 회수 4,000, 부족 1,000 (최우선변제 없이 계산하면 회수 1,000이었을 것)
+    assert expected_recovery(10000, 0.8, 7000, 0, 5000, priority_amount=5000) == (4000, 1000)
+
+
 @pytest.mark.parametrize(
     "region,deposit,eligible,amount",
     [
@@ -74,6 +86,19 @@ def test_classify(jr, tb, shortfall, expected):
     assert classify(jr, tb, shortfall) == expected
 
 
+@pytest.mark.parametrize(
+    "jr,tb,expected",
+    [
+        (70.0, 70.0, RiskLevel.SAFE),  # "70% 이하 안전권" → 70.0 포함
+        (80.0, 80.0, RiskLevel.CAUTION),
+        (90.0, 90.0, RiskLevel.DANGER),  # HUG 한도 90% 이하 → 90.0은 보증 가입 가능
+        (60.0, 100.0, RiskLevel.DANGER),  # 100% 초과부터 깡통
+    ],
+)
+def test_classify_boundaries_are_inclusive(jr, tb, expected):
+    assert classify(jr, tb, 0) == expected
+
+
 def test_assess_full_case_danger():
     inp = JeonseInput(
         deposit=35000,
@@ -102,6 +127,33 @@ def test_assess_without_income_has_none_ratio():
     result = assess(inp)
     assert result.interest_to_income_ratio is None
     assert result.level == RiskLevel.SAFE
+
+
+def test_assess_small_tenant_priority_improves_recovery():
+    inp = JeonseInput(deposit=5000, market_price=10000, senior_liens=7000, region=Region.SEOUL)
+    result = assess(inp)
+    assert result.small_tenant_protected is True
+    assert result.small_tenant_priority_amount == 5000
+    assert result.expected_recovery == 4000
+    assert result.shortfall == 1000
+    assert any("최우선변제" in r and "먼저" in r for r in result.reasons)
+
+
+def test_income_ratio_warning_uses_unrounded_value():
+    # 월이자 30040*12%/12 = 300.4만원, 월소득 1,000만원 → 30.04%
+    # → 표시는 30.0이지만 경고는 나와야 함
+    inp = JeonseInput(
+        deposit=30040, market_price=100000, own_capital=0, annual_income=12000, loan_rate=12.0
+    )
+    result = assess(inp)
+    assert result.interest_to_income_ratio == 30.0
+    assert any("30%" in r for r in result.reasons)
+
+
+def test_no_loan_needed_has_no_loan_reason():
+    result = assess(JeonseInput(deposit=20000, market_price=50000, own_capital=25000))
+    assert result.required_loan == 0
+    assert not any("대출" in r for r in result.reasons)
 
 
 def test_assess_interest_burden_adds_reason():
