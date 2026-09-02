@@ -2206,8 +2206,23 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 `tests/agents/test_llm.py`:
 ```python
+import os
+
+import pytest
+
 from rent_agent.agents.llm import configure_tracing, get_llm
 from rent_agent.config import Settings
+
+LANGSMITH_KEYS = ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT")
+
+
+@pytest.fixture(autouse=True)
+def _clean_langsmith_env():
+    """configure_tracing은 의도적으로 os.environ을 직접 바꾼다(monkeypatch 추적 밖).
+    테스트 후 남은 값이 다른 테스트로 누출되지 않게 정리한다."""
+    yield
+    for k in LANGSMITH_KEYS:
+        os.environ.pop(k, None)
 
 
 def test_get_llm_uses_settings(monkeypatch):
