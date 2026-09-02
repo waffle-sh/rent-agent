@@ -1,8 +1,12 @@
 import json
 from datetime import date
 
-from rent_agent.agents.market_agent import make_market_tools, recent_deal_months
-from rent_agent.tools.molit_rent import MockMolitRentClient
+from rent_agent.agents.market_agent import (
+    make_market_tools,
+    recent_deal_months,
+    small_tenant_region,
+)
+from rent_agent.tools.molit_rent import HousingType, MockMolitRentClient, MolitApiError
 
 
 def test_recent_deal_months():
@@ -83,7 +87,90 @@ def test_get_recent_jeonse_deals_officetel_no_jeonse():
     assert out["count"] == 0 and "message" in out
 
 
-def test_get_recent_jeonse_deals_invalid_housing_type():
+def test_housing_type_is_an_enum_in_tool_schema():
     _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
-    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "housing_type": "villa"}))
-    assert "error" in out and "multi_house" in out["error"]
+    props = get_recent_jeonse_deals.args_schema.model_json_schema()["properties"]
+    assert props["housing_type"]["enum"] == ["apartment", "multi_house", "officetel"]
+
+
+def test_months_is_clamped_and_errors_are_reported():
+    class FlakyClient:
+        calls: list[str] = []
+
+        def fetch(self, lawd_cd, deal_ymd, housing_type=HousingType.APARTMENT, num_of_rows=1000):
+            self.calls.append(deal_ymd)
+            if deal_ymd.endswith("08"):
+                raise MolitApiError("LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS")
+            return MockMolitRentClient().fetch(lawd_cd, deal_ymd, housing_type)
+
+    client = FlakyClient()
+    _, get_recent_jeonse_deals = make_market_tools(client)
+    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "months": 24}))
+    assert len(out["months_queried"]) == 12  # 24 → 12로 클램프
+    assert len(client.calls) == 12
+    assert any(
+        e.endswith("08: LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS") for e in out["errors"]
+    )
+    assert out["count"] > 0  # 실패한 달을 제외한 나머지는 요약됨
+
+    out0 = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "months": 0}))
+    assert len(out0["months_queried"]) == 1  # 0 → 1
+
+
+def test_reference_uses_new_contract_median_at_exactly_three():
+    from datetime import date as _date
+
+    from rent_agent.tools.molit_rent import RentRecord
+
+    def rec(deposit, contract):
+        return RentRecord(
+            housing_type=HousingType.APARTMENT,
+            building_name="X",
+            sub_type="",
+            dong="d",
+            area_m2=59.9,
+            floor=1,
+            build_year=2000,
+            deal_date=_date(2026, 7, 1),
+            deposit=deposit,
+            monthly_rent=0,
+            contract_type=contract,
+            renewal_right_used=contract == "갱신",
+        )
+
+    class StaticClient:
+        def fetch(self, lawd_cd, deal_ymd, housing_type=HousingType.APARTMENT, num_of_rows=1000):
+            return [rec(50000, "신규"), rec(52000, "신규"), rec(54000, ""), rec(40000, "갱신")]
+
+    _, get_recent_jeonse_deals = make_market_tools(StaticClient())
+    out = json.loads(
+        get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "months": 1, "deposit": 52000})
+    )
+    assert out["new_contract_count"] == 3
+    assert out["reference_basis"] == "신규 계약 중위값" and out["reference_median"] == 52000
+    assert out["ratio_to_reference"] == 100.0
+
+
+def test_small_tenant_region_allowlist_covers_every_code():
+    # 정적 함수(서울→seoul, 그 외→metro_over)가 유효한 범위를 데이터로 고정.
+    # 코드표에 파주·인천 등을 추가하면 이 테스트가 먼저 깨진다.
+    from rent_agent.tools.lawd_code import LAWD_CODES
+
+    metro_over_cities = (
+        "수원시",
+        "성남시",
+        "고양시",
+        "용인시",
+        "부천시",
+        "안양시",
+        "화성시",
+        "하남시",
+        "광명시",
+        "과천시",
+    )
+    for name in LAWD_CODES:
+        if name.startswith("서울"):
+            assert small_tenant_region(name) == "seoul"
+        else:
+            assert any(city in name for city in metro_over_cities), name
+            assert small_tenant_region(name) == "metro_over"

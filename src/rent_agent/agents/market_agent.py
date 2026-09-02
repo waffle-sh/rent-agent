@@ -3,6 +3,7 @@
 import json
 from dataclasses import asdict
 from datetime import date
+from typing import Literal
 
 from langchain.agents import create_agent
 from langchain_core.tools import BaseTool, tool
@@ -21,6 +22,8 @@ from rent_agent.tools.molit_rent import (
 )
 
 MIN_NEW_CONTRACTS = 3  # 신규 계약이 이 건수 이상이면 신규 중위값을 시세 기준으로 쓴다
+# 조회 개월 수 클램프. 12개월 × 최대 2페이지면 충분하고 그 이상은 "현재 시세"가 아니다
+MIN_MONTHS, MAX_MONTHS = 1, 12
 
 
 def small_tenant_region(region_name: str) -> str:
@@ -64,7 +67,7 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
     @tool
     def get_recent_jeonse_deals(
         lawd_cd: str,
-        housing_type: str = "apartment",
+        housing_type: Literal["apartment", "multi_house", "officetel"] = "apartment",
         building_name: str | None = None,
         area_m2: float | None = None,
         months: int = 3,
@@ -79,13 +82,9 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
         new_contract_median(갱신 제외), reference_median·reference_basis(도구가 정한 시세 기준값:
         신규 3건 이상이면 신규 중위값, 아니면 전체), ratio_to_reference(deposit ÷ reference_median
         × 100, deposit이 있을 때만), min/max_deposit(만원), recent(최근 5건), months_queried."""
-        try:
-            htype = HousingType(housing_type)
-        except ValueError:
-            valid = ", ".join(t.value for t in HousingType)
-            return json.dumps(
-                {"error": f"housing_type은 다음 중 하나여야 합니다: {valid}"}, ensure_ascii=False
-            )
+        # Literal이 스키마에서 이미 검증 — 잘못된 값은 LLM에 오류 ToolMessage로 돌아감
+        htype = HousingType(housing_type)
+        months = max(MIN_MONTHS, min(months, MAX_MONTHS))  # 0/음수 방지, 과다 API 호출 방지
 
         records = []
         errors: list[str] = []
