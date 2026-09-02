@@ -1,0 +1,2546 @@
+# rent-agent MVP (전세 멀티에이전트) Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 사회초년생/무주택자가 (1) 부동산 법령·제도·전세사기 예방 지식을 질문하고, (2) 전세 매물 정보(보증금·시세·근저당·자산)를 입력하면 위험도를 근거와 함께 판정받는 LangGraph 멀티에이전트 서비스를 Streamlit UI로 제공한다.
+
+**Architecture:** LangGraph `create_supervisor` 패턴. Supervisor(라우터)가 사용자 요청을 4개 전문 에이전트(지식 QA / 시세 조회 / 위험 판단 / 리포트)에 위임한다. 지식 QA는 Chroma RAG, 시세 조회는 국토부 아파트 전월세 실거래가 API, 위험 판단은 **LLM이 아닌 순수 Python 규칙 함수**(재현 가능·테스트 가능)로 계산하고 LLM은 설명만 담당한다. 리포트 에이전트가 앞 에이전트들의 결과를 종합한다.
+
+**Tech Stack:** Python 3.12, uv, langchain 1.3.x / langgraph 1.2.x / langgraph-supervisor 0.0.31, langchain-openai (gpt-4.1-mini + text-embedding-3-small), langchain-chroma + chromadb, httpx + xmltodict, pydantic-settings, Streamlit, pytest, ruff, RAGAS 0.4.3 (langchain-community 0.3.31 고정 — ADR-0005), LangSmith 트레이싱, GitHub Actions CI.
+
+---
+
+## 0. 사전 확인 사항 (2026-09-02 실측)
+
+- `gh` 로그인 계정: `waffle-sh`. 원격 레포 `https://github.com/waffle-sh/rent-agent.git` (public, 비어 있음).
+- `.env` 존재. 키 이름: `APARTMENT_OPENAPI_KEY`, `APARTMENT_OPENAPI_ENDPOINT`(=`https://apis.data.go.kr/1613000/RTMSDataSvcAptRent`), `OPENAI_API_KEY`, `LANGSMITH_API_KEY`.
+- **`APARTMENT_OPENAPI_KEY`는 URL 인코딩된 "Encoding 키"** (`%` 포함, 98자). httpx `params=`로 넘기면 이중 인코딩되어 `SERVICE_KEY_IS_NOT_REGISTERED_ERROR`가 난다. → `urllib.parse.unquote` 후 사용 (Task 2).
+- 실거래가 API 응답은 XML. 실제 필드명: `aptNm, buildYear, dealYear, dealMonth, dealDay, deposit("100,000" 만원·콤마), monthlyRent("0"이면 전세), excluUseAr, floor, umdNm, jibun, sggCd, contractType, useRRRight`, body에 `totalCount`. 에러 시 루트가 `OpenAPI_ServiceResponse`이고 `cmmMsgHeader/errMsg`에 메시지.
+- `ragas==0.4.3`은 `langchain_community.chat_models.vertexai`를 하드 import → `langchain-community>=0.4`와 충돌. `langchain-community==0.3.31`로 고정하면 langchain 1.3.18과 함께 정상 동작 확인.
+- 프로젝트 루트는 `/mnt/d/MetaM/00.etc/agent` (CLAUDE.md 있음). 이 안에 바로 스캐폴딩한다.
+
+## 1. 파일 구조
+
+```
+agent/                                   # 레포 루트 (GitHub: waffle-sh/rent-agent)
+├── CLAUDE.md
+├── README.md                            # 아키텍처·실행법·설계 근거 요약 (한국어)
+├── pyproject.toml                       # uv 프로젝트, ruff/pytest 설정
+├── .python-version                      # 3.12
+├── .gitignore
+├── .env.example
+├── .github/workflows/ci.yml             # ruff + pytest(unit)
+├── docs/
+│   ├── adr/                             # 설계 결정 기록 (규칙: 모든 결정에 근거)
+│   │   ├── 0001-llm-openai.md
+│   │   ├── 0002-vector-store-chroma.md
+│   │   ├── 0003-multi-agent-supervisor.md
+│   │   ├── 0004-jeonse-risk-rules.md
+│   │   ├── 0005-ragas-langchain-community-pin.md
+│   │   └── 0006-uv-python312-streamlit.md
+│   └── superpowers/plans/2026-09-02-rent-agent-mvp.md
+├── data/
+│   ├── raw/                             # RAG 원문 (markdown + frontmatter)
+│   └── chroma/                          # 벡터 DB (gitignore)
+├── eval/
+│   ├── dataset.jsonl                    # RAG 평가 질문/정답
+│   └── results/                         # 평가 결과 (gitignore 제외: 결과 md는 커밋)
+├── scripts/
+│   ├── ingest.py                        # data/raw → Chroma
+│   └── eval_rag.py                      # RAGAS 평가
+├── src/rent_agent/
+│   ├── __init__.py
+│   ├── config.py                        # Settings (pydantic-settings)
+│   ├── domain/
+│   │   ├── __init__.py
+│   │   ├── models.py                    # JeonseInput, RiskAssessment, RiskLevel, Region
+│   │   └── risk.py                      # 순수 함수: 전세가율/선순위 부담/회수액/소액임차인/판정
+│   ├── tools/
+│   │   ├── __init__.py
+│   │   ├── lawd_code.py                 # 시군구 법정동코드(5자리) 조회
+│   │   ├── molit_rent.py                # 실거래가 API 클라이언트 + XML 파서 + Mock
+│   │   └── market_stats.py              # 동일 단지/면적 전세 시세 통계
+│   ├── rag/
+│   │   ├── __init__.py
+│   │   ├── loader.py                    # markdown+frontmatter → Document
+│   │   ├── ingest.py                    # 청킹 + Chroma 적재
+│   │   └── retriever.py                 # retriever 팩토리
+│   ├── agents/
+│   │   ├── __init__.py
+│   │   ├── llm.py                       # ChatOpenAI 팩토리
+│   │   ├── prompts.py                   # 모든 시스템 프롬프트 (한 곳에서 관리)
+│   │   ├── knowledge_agent.py
+│   │   ├── market_agent.py
+│   │   ├── risk_agent.py
+│   │   ├── report_agent.py
+│   │   └── supervisor.py                # build_graph()
+│   └── app/
+│       └── streamlit_app.py
+└── tests/
+    ├── conftest.py
+    ├── fixtures/rent_response.xml
+    ├── fixtures/rent_error.xml
+    ├── domain/test_risk.py
+    ├── tools/test_lawd_code.py
+    ├── tools/test_molit_rent.py
+    ├── tools/test_market_stats.py
+    ├── rag/test_loader.py
+    ├── rag/test_ingest.py
+    ├── agents/test_risk_tool.py
+    ├── agents/test_market_tool.py
+    └── agents/test_graph_integration.py  # @integration (OPENAI 키 필요, CI 제외)
+```
+
+**책임 분리 원칙:** `domain/`은 외부 의존 없음(LLM·HTTP 금지). `tools/`는 I/O 경계. `agents/`는 tools/domain을 LangChain tool로 감싸고 프롬프트만 가진다. 이 구조 덕분에 위험 판단 로직은 LLM 없이 100% 유닛 테스트된다.
+
+---
+
+## 2. Tasks
+
+### Task 1: 프로젝트 스캐폴딩 + Git/GitHub 연동
+
+**Files:**
+- Create: `pyproject.toml`, `.python-version`, `.gitignore`, `.env.example`, `README.md`, `src/rent_agent/__init__.py`, `tests/__init__.py`, `tests/conftest.py`
+
+- [ ] **Step 1: uv 프로젝트 초기화 및 의존성 파일 작성**
+
+Run: `cd /mnt/d/MetaM/00.etc/agent && echo "3.12" > .python-version`
+
+Write `pyproject.toml`:
+
+```toml
+[project]
+name = "rent-agent"
+version = "0.1.0"
+description = "사회초년생/무주택자를 위한 전세 리스크 판단 멀티에이전트 (LangGraph + RAG)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "langchain>=1.3,<2",
+    "langchain-core>=1.6,<2",
+    "langchain-openai>=1.6,<2",
+    "langchain-chroma>=1.1,<2",
+    "langchain-text-splitters>=1.1,<2",
+    # ragas 0.4.3이 langchain_community.chat_models.vertexai를 import함 → 0.4.x와 충돌. ADR-0005
+    "langchain-community==0.3.31",
+    "langgraph>=1.2,<2",
+    "langgraph-supervisor>=0.0.31,<0.1",
+    "langgraph-checkpoint>=4.2,<5",
+    "chromadb>=1.5,<2",
+    "langsmith>=0.12,<1",
+    "streamlit>=1.63,<2",
+    "pydantic>=2.13,<3",
+    "pydantic-settings>=2.15,<3",
+    "httpx>=0.28,<1",
+    "xmltodict>=1.0,<2",
+    "python-frontmatter>=1.1,<2",
+    "ragas==0.4.3",
+    "openai>=1.60",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1,<10",
+    "pytest-asyncio>=1.4,<2",
+    "ruff>=0.16,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rent_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: 외부 API(OpenAI 등) 호출이 필요한 테스트. CI에서는 제외"]
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+```
+
+- [ ] **Step 2: .gitignore / .env.example 작성**
+
+`.gitignore`:
+```
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+data/chroma/
+eval/results/*.json
+.streamlit/secrets.toml
+dist/
+```
+
+`.env.example`:
+```
+# OpenAI
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+
+# 공공데이터포털 - 국토교통부 아파트 전월세 실거래가 (Encoding 키 그대로 붙여넣기)
+APARTMENT_OPENAPI_KEY=...
+APARTMENT_OPENAPI_ENDPOINT=https://apis.data.go.kr/1613000/RTMSDataSvcAptRent
+# true면 API 대신 tests/fixtures/rent_response.xml 사용 (키 없이 개발용)
+MOLIT_USE_MOCK=false
+
+# LangSmith 트레이싱
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_...
+LANGSMITH_PROJECT=rent-agent
+```
+
+- [ ] **Step 3: 패키지 골격 + conftest**
+
+`src/rent_agent/__init__.py`:
+```python
+"""rent-agent: 전세 리스크 판단 멀티에이전트."""
+
+__version__ = "0.1.0"
+```
+
+`tests/__init__.py`: 빈 파일.
+
+`tests/conftest.py` (Settings가 필수 키를 요구하므로 테스트에서는 더미 값을 주입한다):
+```python
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _dummy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """유닛 테스트는 실제 키 없이 돌아야 한다. .env 파일도 읽지 않게 한다."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("APARTMENT_OPENAPI_KEY", "test%2Bkey%3D%3D")
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+    monkeypatch.setenv("MOLIT_USE_MOCK", "true")
+```
+
+- [ ] **Step 4: 의존성 설치 및 도구 동작 확인**
+
+Run: `cd /mnt/d/MetaM/00.etc/agent && uv sync`
+Expected: `uv.lock` 생성, `.venv` 생성, 에러 없음. `langchain-community==0.3.31`, `ragas==0.4.3` 포함.
+
+Run: `uv run python -c "from ragas.metrics.collections import Faithfulness; from langgraph_supervisor import create_supervisor; from langchain.agents import create_agent; print('ok')"`
+Expected: `ok`
+
+Run: `uv run ruff check . && uv run pytest`
+Expected: ruff 통과, pytest `no tests ran` (exit 5여도 무방).
+
+- [ ] **Step 5: README 초안**
+
+`README.md`:
+````markdown
+# rent-agent
+
+사회초년생·무주택자를 위한 **전세 리스크 판단 멀티에이전트**.
+부동산 법령/제도/전세사기 예방 지식을 RAG로 답하고, 전세 매물 정보를 입력하면 위험도를 근거와 함께 판정합니다.
+
+## 아키텍처
+
+```mermaid
+flowchart LR
+    U[사용자<br/>Streamlit] --> S[Supervisor<br/>라우팅]
+    S --> K[지식 QA 에이전트<br/>RAG: Chroma]
+    S --> M[시세 조회 에이전트<br/>국토부 실거래가 API]
+    S --> R[위험 판단 에이전트<br/>규칙 기반 계산]
+    S --> P[리포트 에이전트<br/>종합 설명]
+    K --> S
+    M --> S
+    R --> S
+    P --> S
+```
+
+- **Supervisor 패턴** (LangGraph `create_supervisor`): 요청 유형에 따라 전문 에이전트에 위임.
+- **위험 판단은 LLM이 아닌 순수 Python 규칙**으로 계산 → 재현 가능, 유닛 테스트 100%. LLM은 설명만 담당.
+- **RAG 소스**: 주택임대차보호법, 소액임차인 최우선변제 기준, HUG 전세보증, 청년 전세대출, 전세사기 예방 체크리스트.
+- 모든 설계 결정의 근거는 [`docs/adr/`](docs/adr/)에 기록.
+
+## 실행
+
+```bash
+uv sync
+cp .env.example .env   # 키 입력
+uv run python scripts/ingest.py          # 지식 베이스 적재
+uv run streamlit run src/rent_agent/app/streamlit_app.py
+```
+
+## 테스트 / 평가
+
+```bash
+uv run pytest                 # 유닛 테스트 (외부 API 불필요)
+uv run pytest -m integration  # 실제 LLM 호출 통합 테스트
+uv run python scripts/eval_rag.py   # RAGAS 평가 → eval/results/
+```
+````
+
+- [ ] **Step 6: git init, 원격 연결, 첫 커밋 & 푸시**
+
+주의: 전역 git 이메일이 회사 계정(`suhyun.lee@meta-m.co.kr`)이고 레포는 개인 계정(`waffle-sh`)의 공개 포트폴리오다. 사용자 결정(2026-09-02): 개인 이메일 사용. **첫 커밋 전에** 레포 로컬 설정으로 지정한다(전역 설정은 건드리지 않음):
+
+```bash
+git config user.email "suhyunlee.1117@gmail.com"
+git config user.name "waffle-sh"
+```
+
+Run:
+```bash
+cd /mnt/d/MetaM/00.etc/agent
+git init -b main
+git remote add origin https://github.com/waffle-sh/rent-agent.git
+git add .
+git commit -m "chore: uv 프로젝트 스캐폴딩 및 의존성 고정
+
+- langchain 1.3 / langgraph 1.2 / langgraph-supervisor
+- ragas 0.4.3 호환을 위해 langchain-community 0.3.31 고정
+- ruff, pytest(integration 마커) 설정
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+git push -u origin main
+```
+Expected: 푸시 성공. `gh repo view waffle-sh/rent-agent --json isEmpty` → `false`.
+
+---
+
+### Task 2: Settings (config.py)
+
+**Files:**
+- Create: `src/rent_agent/config.py`
+- Test: `tests/test_config.py`
+
+- [ ] **Step 1: 실패 테스트 작성**
+
+`tests/test_config.py`:
+```python
+from rent_agent.config import Settings, get_settings
+
+
+def test_settings_reads_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-abc")
+    monkeypatch.setenv("APARTMENT_OPENAPI_KEY", "abc%2Bdef%3D%3D")
+    s = Settings(_env_file=None)
+    assert s.openai_api_key == "sk-abc"
+    assert s.openai_model == "gpt-4.1-mini"
+    assert s.apartment_openapi_endpoint.startswith("https://apis.data.go.kr")
+
+
+def test_apartment_key_is_url_decoded(monkeypatch):
+    """data.go.kr 'Encoding 키'를 그대로 넣어도 httpx가 재인코딩하지 않도록 디코딩된 값을 제공."""
+    monkeypatch.setenv("APARTMENT_OPENAPI_KEY", "abc%2Bdef%3D%3D")
+    s = Settings(_env_file=None)
+    assert s.apartment_openapi_key_decoded == "abc+def=="
+
+
+def test_get_settings_is_cached():
+    assert get_settings() is get_settings()
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `uv run pytest tests/test_config.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'rent_agent.config'`
+
+- [ ] **Step 3: 구현**
+
+`src/rent_agent/config.py`:
+```python
+"""환경 변수 기반 설정. .env 파일은 pydantic-settings가 읽는다."""
+
+from functools import lru_cache
+from pathlib import Path
+from urllib.parse import unquote
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=PROJECT_ROOT / ".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    # OpenAI
+    openai_api_key: str
+    openai_model: str = "gpt-4.1-mini"
+    openai_embedding_model: str = "text-embedding-3-small"
+
+    # 국토부 아파트 전월세 실거래가 (공공데이터포털)
+    apartment_openapi_key: str
+    apartment_openapi_endpoint: str = "https://apis.data.go.kr/1613000/RTMSDataSvcAptRent"
+    molit_use_mock: bool = False
+
+    # RAG
+    raw_docs_dir: Path = PROJECT_ROOT / "data" / "raw"
+    chroma_dir: Path = PROJECT_ROOT / "data" / "chroma"
+    chroma_collection: str = "real_estate_knowledge"
+    retriever_k: int = 4
+
+    # LangSmith (환경변수만 있으면 langchain이 자동 트레이싱)
+    langsmith_api_key: str | None = None
+    langsmith_project: str = "rent-agent"
+
+    @property
+    def apartment_openapi_key_decoded(self) -> str:
+        """공공데이터포털은 'Encoding/Decoding' 두 키를 준다. 어떤 것을 넣어도 동작하도록
+        항상 디코딩하고, HTTP 클라이언트가 한 번만 인코딩하게 한다."""
+        return unquote(self.apartment_openapi_key)
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+```
+
+- [ ] **Step 4: 통과 확인**
+
+Run: `uv run pytest tests/test_config.py -v`
+Expected: 3 passed
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add src/rent_agent/config.py tests/test_config.py
+git commit -m "feat: pydantic-settings 기반 Settings 및 공공데이터 키 디코딩
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 3: 도메인 모델 + 전세 위험 판단 규칙 (LLM 비의존)
+
+**Files:**
+- Create: `src/rent_agent/domain/__init__.py`, `src/rent_agent/domain/models.py`, `src/rent_agent/domain/risk.py`
+- Test: `tests/domain/__init__.py`, `tests/domain/test_risk.py`
+
+**판단 기준 근거 (ADR-0004에 기록):**
+- **전세가율** = 보증금 / 매매가(시세). HUG 전세보증금반환보증 가입 요건이 2023.5.1부터 **90% 이하**. 업계 통용 안전권 **70% 이하**. → ≤70 안전, 70~80 주의, 80~90 위험, >90 매우 위험(보증 가입 불가).
+- **선순위 부담률** = (선순위 근저당 채권최고액 + 선순위 임차보증금 + 내 보증금) / 매매가. 100% 초과면 집을 팔아도 전액 회수 불가(깡통).
+- **경매 시 예상 회수액** = 매매가 × 낙찰가율(기본 0.8, 서울 아파트 평균 수준 가정) − 선순위 채권. 회수액 < 보증금이면 부족액 발생.
+- **소액임차인 최우선변제** (주택임대차보호법 시행령 제10·11조, 2023.2.21 개정): 서울 보증금 1억6,500만 이하 → 5,500만 우선변제 / 과밀억제권역·세종·용인·화성·김포 1억4,500만 → 4,800만 / 광역시 등 8,500만 → 2,800만 / 그 외 7,500만 → 2,500만.
+- **자금 부담**: 필요 대출 = 보증금 − 자기자금, 월 이자 = 대출 × 금리 / 12. 월 이자 / 월소득 > 30%면 경고(주거비 30% 규칙).
+
+- [ ] **Step 1: 실패 테스트 작성**
+
+`tests/domain/__init__.py`: 빈 파일.
+
+`tests/domain/test_risk.py`:
+```python
+import pytest
+
+from rent_agent.domain.models import JeonseInput, Region, RiskLevel
+from rent_agent.domain.risk import (
+    assess,
+    classify,
+    expected_recovery,
+    jeonse_ratio,
+    small_tenant_protection,
+    total_burden_ratio,
+)
+
+
+def test_jeonse_ratio_percent():
+    assert jeonse_ratio(deposit=35000, market_price=50000) == pytest.approx(70.0)
+
+
+def test_total_burden_includes_senior_claims():
+    # 근저당 1억 + 선순위 보증금 5천 + 내 보증금 3억 / 매매가 5억 = 90%
+    assert total_burden_ratio(
+        deposit=30000, senior_liens=10000, senior_deposits=5000, market_price=50000
+    ) == pytest.approx(90.0)
+
+
+def test_expected_recovery_and_shortfall():
+    # 5억 * 0.8 = 4억 낙찰, 선순위 1억 → 회수 가능 3억, 보증금 3.5억 → 부족 5천
+    recovery, shortfall = expected_recovery(
+        market_price=50000, auction_ratio=0.8, senior_liens=10000, senior_deposits=0, deposit=35000
+    )
+    assert recovery == 30000
+    assert shortfall == 5000
+
+
+def test_expected_recovery_no_shortfall_is_zero():
+    _, shortfall = expected_recovery(
+        market_price=50000, auction_ratio=0.8, senior_liens=0, senior_deposits=0, deposit=30000
+    )
+    assert shortfall == 0
+
+
+@pytest.mark.parametrize(
+    "region,deposit,eligible,amount",
+    [
+        (Region.SEOUL, 16500, True, 5500),
+        (Region.SEOUL, 16501, False, 0),
+        (Region.METRO_OVER, 14500, True, 4800),
+        (Region.METRO_CITY, 8500, True, 2800),
+        (Region.OTHER, 7500, True, 2500),
+        (Region.OTHER, 9000, False, 0),
+    ],
+)
+def test_small_tenant_protection(region, deposit, eligible, amount):
+    assert small_tenant_protection(region, deposit) == (eligible, amount)
+
+
+def test_small_tenant_priority_capped_by_deposit():
+    # 보증금 3천만이면 우선변제액도 3천만 (5,500만 아님)
+    assert small_tenant_protection(Region.SEOUL, 3000) == (True, 3000)
+
+
+@pytest.mark.parametrize(
+    "jr,tb,shortfall,expected",
+    [
+        (60.0, 60.0, 0, RiskLevel.SAFE),
+        (75.0, 75.0, 0, RiskLevel.CAUTION),
+        (65.0, 85.0, 0, RiskLevel.CAUTION),
+        (85.0, 85.0, 0, RiskLevel.DANGER),
+        (65.0, 65.0, 1000, RiskLevel.DANGER),
+        (95.0, 95.0, 0, RiskLevel.CRITICAL),
+        (60.0, 105.0, 0, RiskLevel.CRITICAL),
+    ],
+)
+def test_classify(jr, tb, shortfall, expected):
+    assert classify(jr, tb, shortfall) == expected
+
+
+def test_assess_full_case_danger():
+    inp = JeonseInput(
+        deposit=35000,
+        market_price=50000,
+        senior_liens=10000,
+        region=Region.SEOUL,
+        own_capital=15000,
+        annual_income=4800,
+        loan_rate=4.0,
+    )
+    result = assess(inp)
+    assert result.jeonse_ratio == pytest.approx(70.0)
+    assert result.total_burden_ratio == pytest.approx(90.0)
+    assert result.shortfall == 5000
+    assert result.level == RiskLevel.DANGER
+    assert result.small_tenant_protected is False
+    assert result.required_loan == 20000
+    assert result.monthly_interest == pytest.approx(20000 * 0.04 / 12, abs=1)
+    # 월소득 400만, 월이자 약 66.7만 → 약 16.7%
+    assert result.interest_to_income_ratio == pytest.approx(16.7, abs=0.1)
+    assert any("근저당" in r or "선순위" in r for r in result.reasons)
+
+
+def test_assess_without_income_has_none_ratio():
+    inp = JeonseInput(deposit=20000, market_price=50000)
+    result = assess(inp)
+    assert result.interest_to_income_ratio is None
+    assert result.level == RiskLevel.SAFE
+
+
+def test_assess_interest_burden_adds_reason():
+    # 보증금 3억 전부 대출, 금리 5%, 연소득 3천 → 월이자 125만 / 월소득 250만 = 50%
+    inp = JeonseInput(deposit=30000, market_price=60000, own_capital=0, annual_income=3000, loan_rate=5.0)
+    result = assess(inp)
+    assert result.interest_to_income_ratio == pytest.approx(50.0)
+    assert any("30%" in r for r in result.reasons)
+
+
+def test_input_validation_rejects_zero_price():
+    with pytest.raises(ValueError):
+        JeonseInput(deposit=1000, market_price=0)
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `uv run pytest tests/domain -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'rent_agent.domain'`
+
+- [ ] **Step 3: 모델 구현**
+
+`src/rent_agent/domain/__init__.py`: 빈 파일.
+
+`src/rent_agent/domain/models.py`:
+```python
+"""전세 위험 판단 입출력 모델. 금액 단위는 모두 '만원'."""
+
+from enum import StrEnum
+
+from pydantic import BaseModel, Field
+
+
+class Region(StrEnum):
+    """소액임차인 최우선변제 기준 지역 구분 (주택임대차보호법 시행령 제10조·제11조)."""
+
+    SEOUL = "seoul"  # 서울특별시
+    METRO_OVER = "metro_over"  # 과밀억제권역(서울 제외), 세종, 용인, 화성, 김포
+    METRO_CITY = "metro_city"  # 광역시(과밀억제권역·군 제외), 안산, 광주, 파주, 이천, 평택
+    OTHER = "other"  # 그 밖의 지역
+
+
+class JeonseInput(BaseModel):
+    deposit: int = Field(..., gt=0, description="전세 보증금 (만원)")
+    market_price: int = Field(..., gt=0, description="해당 주택 매매 시세 (만원)")
+    senior_liens: int = Field(0, ge=0, description="등기부 을구 선순위 근저당 채권최고액 합계 (만원)")
+    senior_deposits: int = Field(0, ge=0, description="나보다 먼저 들어온 임차인 보증금 합계 (만원, 다가구 등)")
+    region: Region = Field(Region.SEOUL, description="소액임차인 기준 지역")
+    own_capital: int = Field(0, ge=0, description="자기자금 (만원)")
+    annual_income: int | None = Field(None, gt=0, description="연소득 (만원)")
+    loan_rate: float = Field(3.5, ge=0, description="전세대출 예상 금리 (연 %)")
+    auction_ratio: float = Field(0.8, gt=0, le=1, description="경매 낙찰가율 가정 (0~1)")
+
+
+class RiskLevel(StrEnum):
+    SAFE = "안전"
+    CAUTION = "주의"
+    DANGER = "위험"
+    CRITICAL = "매우 위험"
+
+
+class RiskAssessment(BaseModel):
+    jeonse_ratio: float = Field(description="전세가율 (%)")
+    total_burden_ratio: float = Field(description="선순위 포함 총 부담률 (%)")
+    expected_recovery: int = Field(description="경매 시 예상 회수 가능액 (만원)")
+    shortfall: int = Field(description="보증금 대비 회수 부족액 (만원, 0이면 전액 회수 가정)")
+    small_tenant_protected: bool = Field(description="소액임차인 최우선변제 대상 여부")
+    small_tenant_priority_amount: int = Field(description="최우선변제 가능액 (만원)")
+    required_loan: int = Field(description="필요 대출액 (만원)")
+    monthly_interest: float = Field(description="월 이자 (만원)")
+    interest_to_income_ratio: float | None = Field(description="월 이자 / 월 소득 (%)")
+    level: RiskLevel
+    reasons: list[str] = Field(description="판정 근거 (사람이 읽는 문장)")
+```
+
+- [ ] **Step 4: 규칙 함수 구현**
+
+`src/rent_agent/domain/risk.py`:
+```python
+"""전세 위험 판단 규칙. 외부 의존 없음 — LLM/HTTP 금지.
+
+기준 출처 요약 (상세: docs/adr/0004-jeonse-risk-rules.md)
+- 전세가율 90%: HUG 전세보증금반환보증 가입 요건 (2023.5.1~)
+- 전세가율 70%: 업계 통용 안전권
+- 소액임차인 표: 주택임대차보호법 시행령 제10조·제11조 (2023.2.21 개정)
+- 주거비 30% 규칙: 월 주거비가 월소득의 30%를 넘으면 부담 과중으로 보는 통용 기준
+"""
+
+from rent_agent.domain.models import JeonseInput, Region, RiskAssessment, RiskLevel
+
+# (보증금 상한, 최우선변제 한도) 단위: 만원
+SMALL_TENANT_TABLE: dict[Region, tuple[int, int]] = {
+    Region.SEOUL: (16500, 5500),
+    Region.METRO_OVER: (14500, 4800),
+    Region.METRO_CITY: (8500, 2800),
+    Region.OTHER: (7500, 2500),
+}
+
+JEONSE_RATIO_SAFE = 70.0
+JEONSE_RATIO_CAUTION = 80.0
+JEONSE_RATIO_HUG_LIMIT = 90.0
+BURDEN_CAUTION = 80.0
+BURDEN_DANGER = 90.0
+BURDEN_CRITICAL = 100.0
+HOUSING_COST_INCOME_LIMIT = 30.0
+
+
+def jeonse_ratio(deposit: int, market_price: int) -> float:
+    return deposit / market_price * 100
+
+
+def total_burden_ratio(deposit: int, senior_liens: int, senior_deposits: int, market_price: int) -> float:
+    return (deposit + senior_liens + senior_deposits) / market_price * 100
+
+
+def expected_recovery(
+    market_price: int, auction_ratio: float, senior_liens: int, senior_deposits: int, deposit: int
+) -> tuple[int, int]:
+    """경매 시 (회수 가능액, 부족액). 낙찰가에서 선순위를 뺀 잔액이 내 보증금에 배당된다고 가정."""
+    proceeds = int(market_price * auction_ratio)
+    recovery = max(0, min(deposit, proceeds - senior_liens - senior_deposits))
+    return recovery, deposit - recovery
+
+
+def small_tenant_protection(region: Region, deposit: int) -> tuple[bool, int]:
+    limit, priority = SMALL_TENANT_TABLE[region]
+    if deposit > limit:
+        return False, 0
+    return True, min(priority, deposit)
+
+
+def classify(jr: float, burden: float, shortfall: int) -> RiskLevel:
+    if jr > JEONSE_RATIO_HUG_LIMIT or burden > BURDEN_CRITICAL:
+        return RiskLevel.CRITICAL
+    if jr > JEONSE_RATIO_CAUTION or burden > BURDEN_DANGER or shortfall > 0:
+        return RiskLevel.DANGER
+    if jr > JEONSE_RATIO_SAFE or burden > BURDEN_CAUTION:
+        return RiskLevel.CAUTION
+    return RiskLevel.SAFE
+
+
+def assess(inp: JeonseInput) -> RiskAssessment:
+    jr = jeonse_ratio(inp.deposit, inp.market_price)
+    burden = total_burden_ratio(inp.deposit, inp.senior_liens, inp.senior_deposits, inp.market_price)
+    recovery, shortfall = expected_recovery(
+        inp.market_price, inp.auction_ratio, inp.senior_liens, inp.senior_deposits, inp.deposit
+    )
+    protected, priority_amount = small_tenant_protection(inp.region, inp.deposit)
+    required_loan = max(0, inp.deposit - inp.own_capital)
+    monthly_interest = required_loan * inp.loan_rate / 100 / 12
+    ratio_to_income = (
+        round(monthly_interest / (inp.annual_income / 12) * 100, 1) if inp.annual_income else None
+    )
+    level = classify(jr, burden, shortfall)
+
+    reasons: list[str] = []
+    reasons.append(f"전세가율 {jr:.1f}% (안전권 {JEONSE_RATIO_SAFE:.0f}% 이하, HUG 보증 한도 {JEONSE_RATIO_HUG_LIMIT:.0f}%)")
+    if inp.senior_liens or inp.senior_deposits:
+        reasons.append(
+            f"선순위 근저당 {inp.senior_liens:,}만원·선순위 보증금 {inp.senior_deposits:,}만원 포함 "
+            f"총 부담률 {burden:.1f}%"
+        )
+    if shortfall > 0:
+        reasons.append(
+            f"낙찰가율 {inp.auction_ratio:.0%} 가정 경매 시 회수 가능액 {recovery:,}만원, "
+            f"보증금 대비 {shortfall:,}만원 부족"
+        )
+    else:
+        reasons.append(f"낙찰가율 {inp.auction_ratio:.0%} 가정 경매 시에도 보증금 전액 회수 가능")
+    if protected:
+        reasons.append(f"소액임차인 최우선변제 대상: 최대 {priority_amount:,}만원 우선 변제")
+    else:
+        reasons.append("보증금이 소액임차인 기준을 초과하여 최우선변제 대상 아님")
+    if required_loan:
+        reasons.append(f"필요 대출 {required_loan:,}만원, 금리 {inp.loan_rate}% 기준 월 이자 약 {monthly_interest:,.1f}만원")
+    if ratio_to_income is not None and ratio_to_income > HOUSING_COST_INCOME_LIMIT:
+        reasons.append(f"월 이자가 월소득의 {ratio_to_income}%로 권고 상한 {HOUSING_COST_INCOME_LIMIT:.0f}% 초과")
+
+    return RiskAssessment(
+        jeonse_ratio=round(jr, 1),
+        total_burden_ratio=round(burden, 1),
+        expected_recovery=recovery,
+        shortfall=shortfall,
+        small_tenant_protected=protected,
+        small_tenant_priority_amount=priority_amount,
+        required_loan=required_loan,
+        monthly_interest=round(monthly_interest, 1),
+        interest_to_income_ratio=ratio_to_income,
+        level=level,
+        reasons=reasons,
+    )
+```
+
+- [ ] **Step 5: 통과 확인**
+
+Run: `uv run pytest tests/domain -v`
+Expected: 전부 passed (parametrize 포함 약 20개)
+
+- [ ] **Step 6: 커밋**
+
+```bash
+git add src/rent_agent/domain tests/domain
+git commit -m "feat: 전세 위험 판단 도메인 규칙 (전세가율·선순위 부담·회수액·소액임차인)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 4: 법정동 시군구 코드 조회 (lawd_code.py)
+
+**Files:**
+- Create: `src/rent_agent/tools/__init__.py`, `src/rent_agent/tools/lawd_code.py`
+- Test: `tests/tools/__init__.py`, `tests/tools/test_lawd_code.py`
+
+실거래가 API는 `LAWD_CD`(법정동코드 앞 5자리 = 시군구)를 요구한다. MVP는 서울 25개 자치구 + 경기 주요 시를 내장 dict로 두고, 이후 행안부 법정동코드 전체 파일로 확장한다(ADR에 기록).
+
+- [ ] **Step 1: 실패 테스트**
+
+`tests/tools/__init__.py`: 빈 파일.
+
+`tests/tools/test_lawd_code.py`:
+```python
+from rent_agent.tools.lawd_code import find_lawd_codes
+
+
+def test_exact_gu_name():
+    assert find_lawd_codes("강남구") == [("서울특별시 강남구", "11680")]
+
+
+def test_partial_match_returns_multiple():
+    results = find_lawd_codes("서울")
+    assert len(results) == 25
+    assert ("서울특별시 종로구", "11110") in results
+
+
+def test_dong_name_not_supported_returns_empty():
+    assert find_lawd_codes("역삼동") == []
+
+
+def test_whitespace_and_suffix_tolerant():
+    assert find_lawd_codes(" 강남 ") == [("서울특별시 강남구", "11680")]
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `uv run pytest tests/tools/test_lawd_code.py -v`
+Expected: FAIL — ModuleNotFoundError
+
+- [ ] **Step 3: 구현**
+
+`src/rent_agent/tools/__init__.py`: 빈 파일.
+
+`src/rent_agent/tools/lawd_code.py`:
+```python
+"""시군구 법정동코드(5자리) 조회. 출처: 행정안전부 법정동코드 (https://www.code.go.kr).
+
+MVP 범위: 서울 25개 자치구 + 경기 주요 시. 전체 코드는 행안부 파일을 CSV로 내려받아 확장 가능.
+"""
+
+LAWD_CODES: dict[str, str] = {
+    "서울특별시 종로구": "11110",
+    "서울특별시 중구": "11140",
+    "서울특별시 용산구": "11170",
+    "서울특별시 성동구": "11200",
+    "서울특별시 광진구": "11215",
+    "서울특별시 동대문구": "11230",
+    "서울특별시 중랑구": "11260",
+    "서울특별시 성북구": "11290",
+    "서울특별시 강북구": "11305",
+    "서울특별시 도봉구": "11320",
+    "서울특별시 노원구": "11350",
+    "서울특별시 은평구": "11380",
+    "서울특별시 서대문구": "11410",
+    "서울특별시 마포구": "11440",
+    "서울특별시 양천구": "11470",
+    "서울특별시 강서구": "11500",
+    "서울특별시 구로구": "11530",
+    "서울특별시 금천구": "11545",
+    "서울특별시 영등포구": "11560",
+    "서울특별시 동작구": "11590",
+    "서울특별시 관악구": "11620",
+    "서울특별시 서초구": "11650",
+    "서울특별시 강남구": "11680",
+    "서울특별시 송파구": "11710",
+    "서울특별시 강동구": "11740",
+    "경기도 수원시 장안구": "41111",
+    "경기도 수원시 권선구": "41113",
+    "경기도 수원시 팔달구": "41115",
+    "경기도 수원시 영통구": "41117",
+    "경기도 성남시 수정구": "41131",
+    "경기도 성남시 중원구": "41133",
+    "경기도 성남시 분당구": "41135",
+    "경기도 고양시 덕양구": "41281",
+    "경기도 고양시 일산동구": "41285",
+    "경기도 고양시 일산서구": "41287",
+    "경기도 용인시 처인구": "41461",
+    "경기도 용인시 기흥구": "41463",
+    "경기도 용인시 수지구": "41465",
+    "경기도 부천시": "41190",
+    "경기도 안양시 만안구": "41171",
+    "경기도 안양시 동안구": "41173",
+    "경기도 화성시": "41590",
+    "경기도 하남시": "41450",
+    "경기도 광명시": "41210",
+    "경기도 과천시": "41290",
+}
+
+
+def find_lawd_codes(query: str) -> list[tuple[str, str]]:
+    """지역명 부분 일치로 (정식 명칭, 코드) 목록 반환. 동(洞) 단위는 지원하지 않는다."""
+    q = query.strip()
+    if not q:
+        return []
+    return [(name, code) for name, code in LAWD_CODES.items() if q in name]
+```
+
+- [ ] **Step 4: 통과 확인**
+
+Run: `uv run pytest tests/tools/test_lawd_code.py -v`
+Expected: 4 passed
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add src/rent_agent/tools tests/tools
+git commit -m "feat: 시군구 법정동코드 조회 도구
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 5: 실거래가 API 클라이언트 + XML 파서 + Mock (molit_rent.py)
+
+**Files:**
+- Create: `src/rent_agent/tools/molit_rent.py`, `tests/fixtures/rent_response.xml`, `tests/fixtures/rent_error.xml`
+- Test: `tests/tools/test_molit_rent.py`
+
+- [ ] **Step 1: 픽스처 작성 (2026-09-02 실제 응답 기반, 필드명 그대로)**
+
+`tests/fixtures/rent_response.xml`:
+```xml
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><response><header><resultCode>000</resultCode><resultMsg>OK</resultMsg></header><body><items><item><aptNm>디에이치자이개포</aptNm><aptSeq>11680-4988</aptSeq><buildYear>2021</buildYear><contractTerm> </contractTerm><contractType> </contractType><dealDay>24</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>100,000</deposit><excluUseAr>76.46</excluUseAr><floor>12</floor><jibun>743</jibun><monthlyRent>200</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>일원동</umdNm><useRRRight> </useRRRight></item><item><aptNm>까치마을</aptNm><aptSeq>11680-314</aptSeq><buildYear>1993</buildYear><contractTerm>26.08~28.08</contractTerm><contractType>신규</contractType><dealDay>18</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>20,000</deposit><excluUseAr>39.6</excluUseAr><floor>11</floor><jibun>746</jibun><monthlyRent>90</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>수서동</umdNm><useRRRight> </useRRRight></item><item><aptNm>까치마을</aptNm><aptSeq>11680-314</aptSeq><buildYear>1993</buildYear><contractTerm>26.08~28.08</contractTerm><contractType>갱신</contractType><dealDay>10</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>45,000</deposit><excluUseAr>39.6</excluUseAr><floor>5</floor><jibun>746</jibun><monthlyRent>0</monthlyRent><preDeposit>40,000</preDeposit><preMonthlyRent>0</preMonthlyRent><sggCd>11680</sggCd><umdNm>수서동</umdNm><useRRRight>사용</useRRRight></item><item><aptNm>까치마을</aptNm><aptSeq>11680-314</aptSeq><buildYear>1993</buildYear><contractTerm> </contractTerm><contractType>신규</contractType><dealDay>3</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>47,000</deposit><excluUseAr>49.5</excluUseAr><floor>8</floor><jibun>746</jibun><monthlyRent>0</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>수서동</umdNm><useRRRight> </useRRRight></item></items><numOfRows>4</numOfRows><pageNo>1</pageNo><totalCount>1265</totalCount></body></response>
+```
+
+`tests/fixtures/rent_error.xml`:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<OpenAPI_ServiceResponse>
+<cmmMsgHeader>
+  <errMsg>SERVICE_KEY_IS_NOT_REGISTERED_ERROR</errMsg>
+  <returnAuthMsg>등록되지 않은 서비스키</returnAuthMsg>
+  <returnReasonCode>30</returnReasonCode>
+</cmmMsgHeader>
+</OpenAPI_ServiceResponse>
+```
+
+- [ ] **Step 2: 실패 테스트**
+
+`tests/tools/test_molit_rent.py`:
+```python
+from datetime import date
+from pathlib import Path
+
+import httpx
+import pytest
+
+from rent_agent.tools.molit_rent import (
+    MockMolitRentClient,
+    MolitApiError,
+    MolitRentClient,
+    RentRecord,
+    parse_rent_xml,
+)
+
+FIXTURES = Path(__file__).parent.parent / "fixtures"
+
+
+def test_parse_rent_xml_records_and_total():
+    records, total = parse_rent_xml((FIXTURES / "rent_response.xml").read_text(encoding="utf-8"))
+    assert total == 1265
+    assert len(records) == 4
+    first = records[0]
+    assert first == RentRecord(
+        apt_name="디에이치자이개포",
+        dong="일원동",
+        area_m2=76.46,
+        floor=12,
+        build_year=2021,
+        deal_date=date(2026, 7, 24),
+        deposit=100000,
+        monthly_rent=200,
+        contract_type="",
+        renewal_right_used=False,
+    )
+
+
+def test_parse_handles_comma_deposit_and_renewal_flag():
+    records, _ = parse_rent_xml((FIXTURES / "rent_response.xml").read_text(encoding="utf-8"))
+    renewed = records[2]
+    assert renewed.deposit == 45000
+    assert renewed.monthly_rent == 0
+    assert renewed.is_jeonse is True
+    assert renewed.renewal_right_used is True
+    assert renewed.contract_type == "갱신"
+
+
+def test_parse_error_response_raises():
+    with pytest.raises(MolitApiError, match="SERVICE_KEY_IS_NOT_REGISTERED_ERROR"):
+        parse_rent_xml((FIXTURES / "rent_error.xml").read_text(encoding="utf-8"))
+
+
+def test_parse_empty_items():
+    xml = (
+        '<response><header><resultCode>000</resultCode><resultMsg>OK</resultMsg></header>'
+        "<body><items/><numOfRows>10</numOfRows><pageNo>1</pageNo><totalCount>0</totalCount></body></response>"
+    )
+    records, total = parse_rent_xml(xml)
+    assert records == [] and total == 0
+
+
+def test_client_sends_decoded_key_once(monkeypatch):
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(200, text=(FIXTURES / "rent_response.xml").read_text(encoding="utf-8"))
+
+    transport = httpx.MockTransport(handler)
+    client = MolitRentClient(
+        endpoint="https://apis.data.go.kr/1613000/RTMSDataSvcAptRent",
+        service_key="abc+def==",
+        http=httpx.Client(transport=transport),
+    )
+    records = client.fetch(lawd_cd="11680", deal_ymd="202607")
+    assert len(records) == 4
+    # httpx가 한 번만 인코딩: '+' → %2B, '=' → %3D
+    assert "serviceKey=abc%2Bdef%3D%3D" in captured["url"]
+    assert "LAWD_CD=11680" in captured["url"] and "DEAL_YMD=202607" in captured["url"]
+
+
+def test_client_http_error_wrapped():
+    transport = httpx.MockTransport(lambda req: httpx.Response(500, text="boom"))
+    client = MolitRentClient(endpoint="https://x", service_key="k", http=httpx.Client(transport=transport))
+    with pytest.raises(MolitApiError):
+        client.fetch(lawd_cd="11680", deal_ymd="202607")
+
+
+def test_mock_client_returns_fixture():
+    records = MockMolitRentClient().fetch(lawd_cd="11680", deal_ymd="202607")
+    assert len(records) == 4
+```
+
+- [ ] **Step 3: 실패 확인**
+
+Run: `uv run pytest tests/tools/test_molit_rent.py -v`
+Expected: FAIL — ModuleNotFoundError
+
+- [ ] **Step 4: 구현**
+
+`src/rent_agent/tools/molit_rent.py`:
+```python
+"""국토교통부 아파트 전월세 실거래가 API 클라이언트.
+
+- 문서: 공공데이터포털 "국토교통부_아파트 전월세 실거래가 자료" (RTMSDataSvcAptRent)
+- 요청: GET {endpoint}/getRTMSDataSvcAptRent?serviceKey&LAWD_CD(5자리)&DEAL_YMD(YYYYMM)&pageNo&numOfRows
+- 응답: XML. 금액은 '만원' 단위 문자열에 콤마 포함 ("100,000").
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Protocol
+
+import httpx
+import xmltodict
+
+FIXTURE_PATH = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "rent_response.xml"
+
+
+class MolitApiError(RuntimeError):
+    """API 오류(키 미등록, 쿼터 초과, HTTP 오류 등)."""
+
+
+@dataclass(frozen=True)
+class RentRecord:
+    apt_name: str
+    dong: str
+    area_m2: float
+    floor: int
+    build_year: int
+    deal_date: date
+    deposit: int  # 만원
+    monthly_rent: int  # 만원, 0이면 전세
+    contract_type: str  # "신규" | "갱신" | ""
+    renewal_right_used: bool
+
+    @property
+    def is_jeonse(self) -> bool:
+        return self.monthly_rent == 0
+
+
+def _to_int(value: str | None) -> int:
+    if value is None:
+        return 0
+    cleaned = value.replace(",", "").strip()
+    return int(cleaned) if cleaned else 0
+
+
+def _to_float(value: str | None) -> float:
+    return float(value.strip()) if value and value.strip() else 0.0
+
+
+def _clean(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def parse_rent_xml(xml_text: str) -> tuple[list[RentRecord], int]:
+    """XML → (레코드 목록, totalCount). 공공데이터포털 공통 에러 포맷은 예외로 변환."""
+    data = xmltodict.parse(xml_text)
+    if "OpenAPI_ServiceResponse" in data:
+        header = data["OpenAPI_ServiceResponse"].get("cmmMsgHeader", {})
+        raise MolitApiError(f"{header.get('errMsg')}: {header.get('returnAuthMsg')}")
+
+    response = data["response"]
+    result_code = _clean(response.get("header", {}).get("resultCode"))
+    if result_code not in ("000", "00"):
+        raise MolitApiError(f"resultCode={result_code}: {response.get('header', {}).get('resultMsg')}")
+
+    body = response.get("body") or {}
+    total = _to_int(body.get("totalCount"))
+    items = (body.get("items") or {}).get("item") or []
+    if isinstance(items, dict):  # 결과가 1건이면 dict로 옴
+        items = [items]
+
+    records = [
+        RentRecord(
+            apt_name=_clean(it.get("aptNm")),
+            dong=_clean(it.get("umdNm")),
+            area_m2=_to_float(it.get("excluUseAr")),
+            floor=_to_int(it.get("floor")),
+            build_year=_to_int(it.get("buildYear")),
+            deal_date=date(_to_int(it.get("dealYear")), _to_int(it.get("dealMonth")), _to_int(it.get("dealDay"))),
+            deposit=_to_int(it.get("deposit")),
+            monthly_rent=_to_int(it.get("monthlyRent")),
+            contract_type=_clean(it.get("contractType")),
+            renewal_right_used=_clean(it.get("useRRRight")) == "사용",
+        )
+        for it in items
+    ]
+    return records, total
+
+
+class RentClient(Protocol):
+    def fetch(self, lawd_cd: str, deal_ymd: str, num_of_rows: int = 1000) -> list[RentRecord]: ...
+
+
+class MolitRentClient:
+    def __init__(self, endpoint: str, service_key: str, http: httpx.Client | None = None) -> None:
+        self._endpoint = endpoint.rstrip("/")
+        self._key = service_key  # 디코딩된 키. httpx가 params로 한 번만 인코딩한다.
+        self._http = http or httpx.Client(timeout=15.0)
+
+    def fetch(self, lawd_cd: str, deal_ymd: str, num_of_rows: int = 1000) -> list[RentRecord]:
+        params = {
+            "serviceKey": self._key,
+            "LAWD_CD": lawd_cd,
+            "DEAL_YMD": deal_ymd,
+            "pageNo": 1,
+            "numOfRows": num_of_rows,
+        }
+        try:
+            resp = self._http.get(f"{self._endpoint}/getRTMSDataSvcAptRent", params=params)
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise MolitApiError(f"HTTP 오류: {e}") from e
+        records, _ = parse_rent_xml(resp.text)
+        return records
+
+
+class MockMolitRentClient:
+    """키 없이 개발/테스트용. 픽스처 XML을 그대로 반환한다."""
+
+    def fetch(self, lawd_cd: str, deal_ymd: str, num_of_rows: int = 1000) -> list[RentRecord]:
+        records, _ = parse_rent_xml(FIXTURE_PATH.read_text(encoding="utf-8"))
+        return records
+```
+
+- [ ] **Step 5: 통과 확인**
+
+Run: `uv run pytest tests/tools/test_molit_rent.py -v`
+Expected: 7 passed
+
+- [ ] **Step 6: 실제 API 스모크 (수동, 1회)**
+
+Run:
+```bash
+uv run python -c "
+from rent_agent.config import get_settings
+from rent_agent.tools.molit_rent import MolitRentClient
+s = get_settings()
+c = MolitRentClient(s.apartment_openapi_endpoint, s.apartment_openapi_key_decoded)
+r = c.fetch('11680', '202607', num_of_rows=3)
+print(len(r), r[0])"
+```
+Expected: `3 RentRecord(apt_name='...', ...)` 출력. `MolitApiError`가 나면 `.env` 키 확인.
+
+- [ ] **Step 7: 커밋**
+
+```bash
+git add src/rent_agent/tools/molit_rent.py tests/tools/test_molit_rent.py tests/fixtures
+git commit -m "feat: 국토부 아파트 전월세 실거래가 클라이언트 및 XML 파서
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 6: 전세 시세 통계 (market_stats.py)
+
+**Files:**
+- Create: `src/rent_agent/tools/market_stats.py`
+- Test: `tests/tools/test_market_stats.py`
+
+- [ ] **Step 1: 실패 테스트**
+
+`tests/tools/test_market_stats.py`:
+```python
+from datetime import date
+
+from rent_agent.tools.market_stats import JeonseMarketSummary, summarize_jeonse
+from rent_agent.tools.molit_rent import RentRecord
+
+
+def rec(apt="까치마을", area=39.6, deposit=40000, rent=0, day=1) -> RentRecord:
+    return RentRecord(
+        apt_name=apt,
+        dong="수서동",
+        area_m2=area,
+        floor=5,
+        build_year=1993,
+        deal_date=date(2026, 7, day),
+        deposit=deposit,
+        monthly_rent=rent,
+        contract_type="신규",
+        renewal_right_used=False,
+    )
+
+
+def test_filters_pure_jeonse_and_apt_and_area():
+    records = [
+        rec(deposit=40000, day=1),
+        rec(deposit=45000, day=2),
+        rec(deposit=50000, day=3),
+        rec(deposit=20000, rent=90),  # 월세 → 제외
+        rec(apt="다른단지", deposit=99999),  # 단지 다름 → 제외
+        rec(area=59.9, deposit=70000),  # 면적 차이 > 허용치 → 제외
+    ]
+    s = summarize_jeonse(records, apt_name="까치마을", area_m2=39.6, area_tolerance=5.0)
+    assert s.count == 3
+    assert s.median_deposit == 45000
+    assert s.min_deposit == 40000 and s.max_deposit == 50000
+    assert [r.deposit for r in s.recent] == [50000, 45000, 40000]  # 최신순
+
+
+def test_apt_name_partial_match_and_no_area_filter():
+    records = [rec(apt="까치마을1단지"), rec(apt="까치마을2단지", area=59.9)]
+    s = summarize_jeonse(records, apt_name="까치마을")
+    assert s.count == 2
+
+
+def test_empty_summary():
+    s = summarize_jeonse([], apt_name="없는단지")
+    assert s == JeonseMarketSummary(count=0, median_deposit=None, min_deposit=None, max_deposit=None, recent=[])
+
+
+def test_compare_ratio():
+    s = summarize_jeonse([rec(deposit=40000), rec(deposit=50000)])
+    assert s.median_deposit == 45000
+    assert s.ratio_to_median(54000) == 120.0
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `uv run pytest tests/tools/test_market_stats.py -v`
+Expected: FAIL — ModuleNotFoundError
+
+- [ ] **Step 3: 구현**
+
+`src/rent_agent/tools/market_stats.py`:
+```python
+"""실거래 레코드 → 전세 시세 요약. 중위값을 쓰는 이유: 소수 고가/저가 거래에 덜 민감."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from statistics import median
+
+from rent_agent.tools.molit_rent import RentRecord
+
+
+@dataclass(frozen=True)
+class JeonseMarketSummary:
+    count: int
+    median_deposit: int | None
+    min_deposit: int | None
+    max_deposit: int | None
+    recent: list[RentRecord] = field(default_factory=list)  # 최신순, 최대 5건
+
+    def ratio_to_median(self, deposit: int) -> float | None:
+        if not self.median_deposit:
+            return None
+        return round(deposit / self.median_deposit * 100, 1)
+
+
+def summarize_jeonse(
+    records: list[RentRecord],
+    apt_name: str | None = None,
+    area_m2: float | None = None,
+    area_tolerance: float = 5.0,
+) -> JeonseMarketSummary:
+    """순수 전세(월세 0)만 대상으로 단지명 부분일치·전용면적 ±허용치로 필터 후 요약."""
+    filtered = [
+        r
+        for r in records
+        if r.is_jeonse
+        and (apt_name is None or apt_name in r.apt_name)
+        and (area_m2 is None or abs(r.area_m2 - area_m2) <= area_tolerance)
+    ]
+    if not filtered:
+        return JeonseMarketSummary(count=0, median_deposit=None, min_deposit=None, max_deposit=None)
+
+    deposits = [r.deposit for r in filtered]
+    recent = sorted(filtered, key=lambda r: r.deal_date, reverse=True)[:5]
+    return JeonseMarketSummary(
+        count=len(filtered),
+        median_deposit=int(median(deposits)),
+        min_deposit=min(deposits),
+        max_deposit=max(deposits),
+        recent=recent,
+    )
+```
+
+- [ ] **Step 4: 통과 확인**
+
+Run: `uv run pytest tests/tools -v`
+Expected: 모두 passed
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add src/rent_agent/tools/market_stats.py tests/tools/test_market_stats.py
+git commit -m "feat: 동일 단지·면적 전세 시세 요약 통계
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 7: RAG 원문 지식 문서 작성 (data/raw)
+
+**Files:**
+- Create: `data/raw/01-jutaek-imdaecha-boho-beop.md`, `data/raw/02-small-tenant-priority.md`, `data/raw/03-jeonse-sagi-checklist.md`, `data/raw/04-hug-jeonse-bojeung.md`, `data/raw/05-youth-jeonse-loan.md`
+
+각 문서는 아래 frontmatter를 갖는다. 수치는 **반드시 source URL의 현재 원문과 대조**해 최신값으로 기입하고 `effective_date`에 기준일을 적는다(법령·대출 조건은 매년 바뀜). 문서 하단에 "출처" 섹션을 둔다.
+
+```markdown
+---
+title: 주택임대차보호법 핵심 조문
+source: https://www.law.go.kr/법령/주택임대차보호법
+effective_date: 2024-01-01
+category: law
+---
+```
+
+- [ ] **Step 1: `01-jutaek-imdaecha-boho-beop.md`** — 항목별로 `## 조문명 (제N조)` 헤더 + 요건/효과/실무 팁. 필수 포함:
+  - 대항력(제3조): 주택 인도 + 전입신고(주민등록) → 다음 날 0시부터 효력. 이사 당일 전입신고의 중요성.
+  - 우선변제권(제3조의2): 대항력 요건 + 확정일자 → 경매 시 후순위 권리자보다 우선 배당.
+  - 최우선변제권(제8조): 소액임차인은 확정일자 없어도 일정액 최우선 변제(경매개시결정 등기 전 대항력 필요). 상세 표는 02 문서 참조.
+  - 임차권등기명령(제3조의3): 계약 종료 후 보증금 미반환 시 단독 신청, 이사 후에도 대항력·우선변제권 유지.
+  - 최단 존속기간 2년(제4조), 묵시적 갱신(제6조), 계약갱신요구권(제6조의3): 1회, 2년, 거절 사유(임대인 실거주, 2기 차임 연체 등), 임대인 실거주 거절 후 제3자 임대 시 손해배상.
+  - 차임·보증금 증액 상한 5%(제7조), 전월세 전환율(제7조의2).
+  - 임대인 정보 제시 의무(제3조의7, 2023.4 신설): 선순위 보증금·납세증명서 요구 가능.
+
+- [ ] **Step 2: `02-small-tenant-priority.md`** — 시행령 제10조·제11조 표 (2023.2.21 개정) 를 markdown 표로. Task 3의 `SMALL_TENANT_TABLE`과 **수치 동일해야 함**(서울 16,500/5,500 · 과밀억제권역 등 14,500/4,800 · 광역시 등 8,500/2,800 · 그 외 7,500/2,500). 각 지역 구분에 속하는 도시 목록, 우선변제액이 주택가액의 1/2 한도임을 명시.
+
+- [ ] **Step 3: `03-jeonse-sagi-checklist.md`** — 계약 전/계약 시/계약 후 3단계 체크리스트 + 대표 사기 유형(깡통전세, 신탁등기 부동산, 이중계약, 무자본 갭투자, 대리인 계약 사기). 계약 전: 등기부등본 갑구(소유자·가압류·신탁) / 을구(근저당 채권최고액), 시세 대비 전세가율, 건축물대장(위반건축물·주택 용도), 임대인 국세·지방세 완납증명, 다가구 선순위 보증금 확인, 공인중개사 등록 확인(국가공간정보포털). 계약 시: 임대인 신분증 대조, 대리인이면 위임장+인감증명, 특약(잔금일 전 근저당 설정 금지, 보증보험 미가입 시 계약 해제 등). 계약 후: 당일 전입신고+확정일자, 전세보증금반환보증 가입, 잔금일 등기부 재확인. 출처: 국토교통부 전세사기 피해 예방 안내, HUG 안심전세포털.
+
+- [ ] **Step 4: `04-hug-jeonse-bojeung.md`** — HUG 전세보증금반환보증: 가입 요건(전세가율 90% 이하, 주택가격 산정 방식—공시가격 126% 등, 선순위채권 한도), 보증 한도(수도권 7억·그 외 5억 이하 보증금), 신청 시기(계약기간 1/2 경과 전), 보증료율 개요, 대상 주택 유형, SGI·HF 상품과의 차이 한 줄. 출처: https://www.khug.or.kr.
+
+- [ ] **Step 5: `05-youth-jeonse-loan.md`** — 주택도시기금 버팀목 전세자금(소득·순자산·보증금 한도·대출 한도·금리 범위), 청년전용 버팀목(만 19~34세 요건), 중소기업취업청년 전월세보증금 대출, 신혼부부 버팀목. 각 상품별 표 + "기준일" 명시. 출처: https://nhuf.molit.go.kr.
+
+- [ ] **Step 6: 확인 및 커밋**
+
+Run: `ls data/raw && head -6 data/raw/*.md`
+Expected: 5개 파일, 모두 frontmatter 시작.
+
+```bash
+git add data/raw
+git commit -m "docs(data): RAG 지식 원문 5종 (임대차보호법·소액임차인·전세사기·HUG보증·청년대출)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 8: RAG 로더 + 인제스트 + 리트리버
+
+**Files:**
+- Create: `src/rent_agent/rag/__init__.py`, `src/rent_agent/rag/loader.py`, `src/rent_agent/rag/ingest.py`, `src/rent_agent/rag/retriever.py`, `scripts/ingest.py`
+- Test: `tests/rag/__init__.py`, `tests/rag/test_loader.py`, `tests/rag/test_ingest.py`
+
+**설계 근거:** 청크 800자/오버랩 100자 — 법령 조문 하나가 대개 300~800자라 조문 단위가 한 청크에 들어가고, 오버랩으로 조문 경계 손실을 완화. 마크다운 헤더(`## `)를 1차 분리자로 써서 조문/항목 경계를 우선 존중. 테스트는 `DeterministicFakeEmbedding`으로 OpenAI 호출 없이 수행.
+
+- [ ] **Step 1: 실패 테스트 (loader)**
+
+`tests/rag/__init__.py`: 빈 파일.
+
+`tests/rag/test_loader.py`:
+```python
+from pathlib import Path
+
+from rent_agent.rag.loader import load_markdown_docs
+
+
+def test_load_markdown_with_frontmatter(tmp_path: Path):
+    (tmp_path / "a.md").write_text(
+        "---\ntitle: 테스트 문서\nsource: https://example.com\neffective_date: 2024-01-01\ncategory: law\n---\n"
+        "## 제1조\n본문입니다.",
+        encoding="utf-8",
+    )
+    (tmp_path / "ignore.txt").write_text("not md", encoding="utf-8")
+    docs = load_markdown_docs(tmp_path)
+    assert len(docs) == 1
+    d = docs[0]
+    assert d.page_content.startswith("## 제1조")
+    assert d.metadata["title"] == "테스트 문서"
+    assert d.metadata["source"] == "https://example.com"
+    assert d.metadata["effective_date"] == "2024-01-01"
+    assert d.metadata["category"] == "law"
+    assert d.metadata["file"] == "a.md"
+
+
+def test_load_missing_frontmatter_uses_filename(tmp_path: Path):
+    (tmp_path / "b.md").write_text("본문만", encoding="utf-8")
+    docs = load_markdown_docs(tmp_path)
+    assert docs[0].metadata["title"] == "b"
+    assert docs[0].metadata["source"] == ""
+```
+
+- [ ] **Step 2: 실패 테스트 (ingest + retriever)**
+
+`tests/rag/test_ingest.py`:
+```python
+from pathlib import Path
+
+from langchain_core.embeddings import DeterministicFakeEmbedding
+
+from rent_agent.rag.ingest import build_vectorstore, split_documents
+from rent_agent.rag.loader import load_markdown_docs
+
+
+def _write_docs(tmp_path: Path) -> Path:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "law.md").write_text(
+        "---\ntitle: 임대차법\nsource: s\ncategory: law\n---\n"
+        "## 대항력\n" + "주택 인도와 전입신고를 하면 다음 날부터 대항력이 생긴다. " * 30
+        + "\n## 우선변제권\n" + "확정일자를 받으면 우선변제권이 생긴다. " * 30,
+        encoding="utf-8",
+    )
+    return raw
+
+
+def test_split_respects_headers_and_keeps_metadata(tmp_path: Path):
+    docs = load_markdown_docs(_write_docs(tmp_path))
+    chunks = split_documents(docs, chunk_size=800, chunk_overlap=100)
+    assert len(chunks) >= 2
+    assert all(c.metadata["title"] == "임대차법" for c in chunks)
+    assert all(len(c.page_content) <= 800 for c in chunks)
+
+
+def test_build_vectorstore_persists_and_searches(tmp_path: Path):
+    raw = _write_docs(tmp_path)
+    chroma_dir = tmp_path / "chroma"
+    emb = DeterministicFakeEmbedding(size=64)
+    vs = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="t", reset=True)
+    assert vs._collection.count() >= 2
+    results = vs.similarity_search("대항력", k=1)
+    assert len(results) == 1
+    assert results[0].metadata["title"] == "임대차법"
+
+
+def test_reset_clears_previous(tmp_path: Path):
+    raw = _write_docs(tmp_path)
+    chroma_dir = tmp_path / "chroma"
+    emb = DeterministicFakeEmbedding(size=64)
+    first = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="t", reset=True)
+    n = first._collection.count()
+    second = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="t", reset=True)
+    assert second._collection.count() == n  # 중복 적재 없음
+```
+
+- [ ] **Step 3: 실패 확인**
+
+Run: `uv run pytest tests/rag -v`
+Expected: FAIL — ModuleNotFoundError
+
+- [ ] **Step 4: 구현**
+
+`src/rent_agent/rag/__init__.py`: 빈 파일.
+
+`src/rent_agent/rag/loader.py`:
+```python
+"""data/raw/*.md → langchain Document. frontmatter를 metadata로 옮긴다."""
+
+from pathlib import Path
+
+import frontmatter
+from langchain_core.documents import Document
+
+
+def load_markdown_docs(raw_dir: Path) -> list[Document]:
+    docs: list[Document] = []
+    for path in sorted(raw_dir.glob("*.md")):
+        post = frontmatter.load(path, encoding="utf-8")
+        meta = {
+            "title": str(post.get("title", path.stem)),
+            "source": str(post.get("source", "")),
+            "effective_date": str(post.get("effective_date", "")),
+            "category": str(post.get("category", "")),
+            "file": path.name,
+        }
+        docs.append(Document(page_content=post.content.strip(), metadata=meta))
+    return docs
+```
+
+`src/rent_agent/rag/ingest.py`:
+```python
+"""청킹 + Chroma 적재. 임베딩을 주입받아 테스트에서는 Fake, 운영에서는 OpenAI를 쓴다."""
+
+import shutil
+from pathlib import Path
+
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from rent_agent.config import Settings
+from rent_agent.rag.loader import load_markdown_docs
+
+# 마크다운 헤더 → 빈 줄 → 줄 → 문장 순으로 자른다. 조문/항목 경계를 우선 존중.
+SEPARATORS = ["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""]
+
+
+def split_documents(docs: list[Document], chunk_size: int = 800, chunk_overlap: int = 100) -> list[Document]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=SEPARATORS
+    )
+    return splitter.split_documents(docs)
+
+
+def build_vectorstore(
+    raw_dir: Path, chroma_dir: Path, embedding: Embeddings, collection: str, reset: bool = False
+) -> Chroma:
+    if reset and chroma_dir.exists():
+        shutil.rmtree(chroma_dir)
+    chroma_dir.mkdir(parents=True, exist_ok=True)
+    chunks = split_documents(load_markdown_docs(raw_dir))
+    return Chroma.from_documents(
+        documents=chunks,
+        embedding=embedding,
+        collection_name=collection,
+        persist_directory=str(chroma_dir),
+    )
+
+
+def get_embedding(settings: Settings) -> Embeddings:
+    return OpenAIEmbeddings(model=settings.openai_embedding_model, api_key=settings.openai_api_key)
+
+
+def ingest(settings: Settings, reset: bool = True) -> int:
+    vs = build_vectorstore(
+        raw_dir=settings.raw_docs_dir,
+        chroma_dir=settings.chroma_dir,
+        embedding=get_embedding(settings),
+        collection=settings.chroma_collection,
+        reset=reset,
+    )
+    return vs._collection.count()
+```
+
+`src/rent_agent/rag/retriever.py`:
+```python
+from langchain_chroma import Chroma
+from langchain_core.embeddings import Embeddings
+from langchain_core.vectorstores import VectorStoreRetriever
+
+from rent_agent.config import Settings
+from rent_agent.rag.ingest import get_embedding
+
+
+def get_vectorstore(settings: Settings, embedding: Embeddings | None = None) -> Chroma:
+    return Chroma(
+        collection_name=settings.chroma_collection,
+        embedding_function=embedding or get_embedding(settings),
+        persist_directory=str(settings.chroma_dir),
+    )
+
+
+def get_retriever(settings: Settings, embedding: Embeddings | None = None) -> VectorStoreRetriever:
+    # MMR: 같은 조문의 인접 청크만 잔뜩 뽑히는 것을 막고 서로 다른 근거를 섞어 준다.
+    return get_vectorstore(settings, embedding).as_retriever(
+        search_type="mmr", search_kwargs={"k": settings.retriever_k, "fetch_k": settings.retriever_k * 4}
+    )
+```
+
+`scripts/ingest.py`:
+```python
+"""data/raw → Chroma 적재. 사용: uv run python scripts/ingest.py [--no-reset]"""
+
+import argparse
+
+from rent_agent.config import get_settings
+from rent_agent.rag.ingest import ingest
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-reset", action="store_true", help="기존 컬렉션 유지 후 추가")
+    args = parser.parse_args()
+    settings = get_settings()
+    n = ingest(settings, reset=not args.no_reset)
+    print(f"적재 완료: {n} chunks → {settings.chroma_dir}")
+```
+
+- [ ] **Step 5: 통과 확인**
+
+Run: `uv run pytest tests/rag -v`
+Expected: 5 passed
+
+`test_reset_clears_previous`가 chromadb의 "같은 경로에 이미 열린 클라이언트" 류 오류로 실패하면, `build_vectorstore`의 `reset` 처리를 `shutil.rmtree` 대신 아래처럼 바꾼다(컬렉션만 비우고 클라이언트는 유지):
+
+```python
+    if reset:
+        existing = Chroma(collection_name=collection, embedding_function=embedding, persist_directory=str(chroma_dir))
+        existing.reset_collection()
+```
+
+- [ ] **Step 6: 실제 적재 + 검색 스모크 (OpenAI 임베딩 사용, 소액 과금)**
+
+Run: `uv run python scripts/ingest.py`
+Expected: `적재 완료: N chunks → .../data/chroma` (N은 수십 개)
+
+Run: `uv run python -c "
+from rent_agent.config import get_settings
+from rent_agent.rag.retriever import get_retriever
+for d in get_retriever(get_settings()).invoke('전입신고 하면 언제부터 대항력이 생기나요'): print(d.metadata['title'], '|', d.page_content[:80].replace(chr(10),' '))"`
+Expected: 주택임대차보호법 문서의 대항력 청크가 상위에 나옴.
+
+- [ ] **Step 7: 커밋**
+
+```bash
+git add src/rent_agent/rag tests/rag scripts/ingest.py
+git commit -m "feat: markdown 로더, 청킹, Chroma 인제스트 및 MMR 리트리버
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 9: LLM 팩토리 + 프롬프트 모음
+
+**Files:**
+- Create: `src/rent_agent/agents/__init__.py`, `src/rent_agent/agents/llm.py`, `src/rent_agent/agents/prompts.py`
+
+- [ ] **Step 1: 구현**
+
+`src/rent_agent/agents/__init__.py`: 빈 파일.
+
+`src/rent_agent/agents/llm.py`:
+```python
+from langchain_openai import ChatOpenAI
+
+from rent_agent.config import Settings
+
+
+def get_llm(settings: Settings, temperature: float = 0.0) -> ChatOpenAI:
+    # temperature 0: 라우팅·수치 설명은 재현성이 중요. 창의성 불필요.
+    return ChatOpenAI(model=settings.openai_model, temperature=temperature, api_key=settings.openai_api_key)
+```
+
+`src/rent_agent/agents/prompts.py`:
+```python
+"""모든 시스템 프롬프트. 한 파일에 모아 두어 변경 이력 추적과 평가 비교가 쉽다."""
+
+SUPERVISOR_PROMPT = """당신은 사회초년생·무주택자를 돕는 부동산(전세) 상담 서비스의 총괄 관리자입니다.
+사용자 요청을 분석해 아래 전문 에이전트에게 작업을 위임하고, 결과를 모아 최종 답변을 만듭니다.
+
+에이전트:
+- knowledge_agent: 부동산 법령·제도·전세사기 예방·보증·대출 지식 질문에 답합니다 (문서 검색 기반).
+- market_agent: 지역·단지·면적을 받아 국토부 실거래가로 최근 전세 시세를 조회합니다.
+- risk_agent: 보증금·시세·근저당·자산 정보를 받아 전세 위험도를 규칙 기반으로 계산합니다.
+- report_agent: 앞 에이전트들의 결과를 종합해 사용자용 최종 리포트를 작성합니다.
+
+위임 규칙:
+1. 단순 지식 질문 → knowledge_agent 만 호출하고 그 답을 그대로 전달합니다.
+2. 전세 매물 진단 요청(보증금·시세 등 숫자가 있음) → risk_agent 호출.
+   지역/단지 정보가 있으면 market_agent 도 호출해 시세 비교를 얻습니다.
+   판단에 필요한 제도(소액임차인, 보증보험 등) 설명이 필요하면 knowledge_agent 도 호출합니다.
+   마지막에 report_agent 를 호출해 종합 리포트를 만들게 하고, 그 리포트를 최종 답변으로 사용합니다.
+3. 사용자가 필수 정보(보증금, 매매 시세)를 주지 않았으면 에이전트를 호출하지 말고 무엇이 필요한지 물어봅니다.
+4. 같은 에이전트를 같은 입력으로 두 번 호출하지 않습니다.
+항상 한국어로 답합니다."""
+
+KNOWLEDGE_PROMPT = """당신은 부동산 임대차 법령·제도 전문 상담사입니다.
+반드시 search_real_estate_knowledge 도구로 근거 문서를 먼저 검색한 뒤, 검색된 내용에 기반해서만 답합니다.
+- 답변 끝에 '근거:' 항목으로 사용한 문서 제목과 출처 URL을 나열합니다.
+- 검색 결과에 없는 내용은 "제공된 자료에서 확인되지 않음"이라고 명시하고 추측하지 않습니다.
+- 법령·금액 기준은 문서의 기준일(effective_date)을 함께 안내합니다.
+- 사회초년생이 이해할 수 있게 용어를 풀어 설명하고, 실무적으로 무엇을 해야 하는지 한 줄로 정리합니다.
+한국어로 답합니다."""
+
+MARKET_PROMPT = """당신은 아파트 전세 실거래가 조회 담당자입니다.
+1. 사용자가 말한 지역명으로 find_region_code 를 호출해 시군구 코드를 찾습니다. 후보가 여럿이면 가장 구체적으로 일치하는 것을 고르고, 판단이 어려우면 후보를 나열해 되묻습니다.
+2. get_recent_jeonse_deals 를 호출해 최근 거래를 요약합니다.
+3. 결과는 거래 건수, 보증금 중위값/최소/최대, 최근 거래 5건, 데이터 한계(아파트만 해당, 단지명 표기 차이 가능)를 포함해 간결히 보고합니다.
+숫자 단위는 '만원'입니다. 추측으로 시세를 만들지 않습니다. 한국어로 답합니다."""
+
+RISK_PROMPT = """당신은 전세 위험 판단 담당자입니다.
+사용자 정보에서 보증금, 매매 시세, 선순위 근저당 채권최고액, 선순위 보증금, 지역, 자기자금, 연소득, 금리를 추출해
+assess_jeonse_risk 도구를 **한 번** 호출합니다. 값이 없으면 도구의 기본값을 씁니다(금액 단위: 만원. '3억' → 30000).
+지역은 서울이면 seoul, 경기 과밀억제권역·세종·용인·화성·김포는 metro_over, 그 외 광역시는 metro_city, 나머지는 other.
+도구 결과(수치·판정·근거)를 그대로 보고하고, 임의로 수치를 바꾸거나 새로 계산하지 않습니다. 한국어로 답합니다."""
+
+REPORT_PROMPT = """당신은 전세 계약 상담 리포트 작성자입니다. 대화에 있는 risk_agent, market_agent, knowledge_agent 의 결과만 사용해
+사회초년생을 위한 최종 리포트를 작성합니다. 새 수치를 만들지 않습니다.
+
+형식:
+## 종합 판정: {안전|주의|위험|매우 위험}
+한 줄 결론.
+
+## 핵심 수치
+- 전세가율, 총 부담률, 경매 시 회수 가능액/부족액, 소액임차인 해당 여부, 필요 대출·월 이자(있으면 소득 대비 %)
+- 시세 비교(market_agent 결과가 있으면): 동일 단지 최근 전세 중위값 대비 %
+
+## 이렇게 판단한 이유
+근거 문장들을 사회초년생 눈높이로 풀어서.
+
+## 계약 전 꼭 할 것
+체크리스트 3~6개 (등기부 재확인, 전입신고+확정일자, 보증보험 가입 가능 여부 등 상황에 맞게).
+
+## 참고한 제도/문서
+knowledge_agent가 준 근거가 있으면 나열.
+
+마지막에 "본 리포트는 입력값과 공개 자료에 기반한 참고 정보이며 법률·금융 자문이 아닙니다."를 붙입니다. 한국어로 씁니다."""
+```
+
+- [ ] **Step 2: 린트 & 커밋**
+
+Run: `uv run ruff check src`
+Expected: 통과
+
+```bash
+git add src/rent_agent/agents
+git commit -m "feat: LLM 팩토리 및 에이전트 시스템 프롬프트
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 10: 위험 판단 에이전트 (risk_agent.py)
+
+**Files:**
+- Create: `src/rent_agent/agents/risk_agent.py`
+- Test: `tests/agents/__init__.py`, `tests/agents/test_risk_tool.py`
+
+- [ ] **Step 1: 실패 테스트 (도구 함수는 LLM 없이 직접 호출)**
+
+`tests/agents/__init__.py`: 빈 파일.
+
+`tests/agents/test_risk_tool.py`:
+```python
+import json
+
+from rent_agent.agents.risk_agent import assess_jeonse_risk
+
+
+def test_tool_returns_json_assessment():
+    out = assess_jeonse_risk.invoke(
+        {"deposit": 35000, "market_price": 50000, "senior_liens": 10000, "region": "seoul", "own_capital": 15000}
+    )
+    data = json.loads(out)
+    assert data["level"] == "위험"
+    assert data["jeonse_ratio"] == 70.0
+    assert data["required_loan"] == 20000
+    assert isinstance(data["reasons"], list) and data["reasons"]
+
+
+def test_tool_invalid_region_message():
+    out = assess_jeonse_risk.invoke({"deposit": 1000, "market_price": 5000, "region": "mars"})
+    assert "region" in out and "seoul" in out
+
+
+def test_tool_has_korean_description():
+    assert "보증금" in assess_jeonse_risk.description
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `uv run pytest tests/agents/test_risk_tool.py -v`
+Expected: FAIL — ModuleNotFoundError
+
+- [ ] **Step 3: 구현**
+
+`src/rent_agent/agents/risk_agent.py`:
+```python
+"""위험 판단 에이전트: 계산은 domain.risk(결정적), LLM은 입력 추출과 설명만."""
+
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+from pydantic import ValidationError
+
+from rent_agent.agents.llm import get_llm
+from rent_agent.agents.prompts import RISK_PROMPT
+from rent_agent.config import Settings
+from rent_agent.domain.models import JeonseInput, Region
+from rent_agent.domain.risk import assess
+
+
+@tool
+def assess_jeonse_risk(
+    deposit: int,
+    market_price: int,
+    senior_liens: int = 0,
+    senior_deposits: int = 0,
+    region: str = "seoul",
+    own_capital: int = 0,
+    annual_income: int | None = None,
+    loan_rate: float = 3.5,
+) -> str:
+    """전세 계약의 위험도를 규칙 기반으로 계산한다. 모든 금액은 '만원' 단위.
+
+    deposit: 전세 보증금. market_price: 해당 주택 매매 시세.
+    senior_liens: 등기부 을구 선순위 근저당 채권최고액 합계. senior_deposits: 선순위 임차보증금 합계.
+    region: seoul | metro_over | metro_city | other (소액임차인 기준 지역).
+    own_capital: 자기자금. annual_income: 연소득(선택). loan_rate: 전세대출 예상 금리(%).
+    반환: 전세가율, 총 부담률, 경매 시 회수액/부족액, 소액임차인 여부, 필요 대출·월 이자, 판정(안전/주의/위험/매우 위험), 근거 문장 목록 (JSON).
+    """
+    try:
+        inp = JeonseInput(
+            deposit=deposit,
+            market_price=market_price,
+            senior_liens=senior_liens,
+            senior_deposits=senior_deposits,
+            region=Region(region),
+            own_capital=own_capital,
+            annual_income=annual_income,
+            loan_rate=loan_rate,
+        )
+    except ValueError as e:  # ValidationError도 ValueError 하위
+        valid = ", ".join(r.value for r in Region)
+        detail = e.errors() if isinstance(e, ValidationError) else str(e)
+        return f"입력 오류: {detail}. region은 다음 중 하나여야 합니다: {valid}"
+    return assess(inp).model_dump_json()
+
+
+def build_risk_agent(settings: Settings):
+    return create_agent(
+        model=get_llm(settings),
+        tools=[assess_jeonse_risk],
+        system_prompt=RISK_PROMPT,
+        name="risk_agent",
+    )
+```
+
+- [ ] **Step 4: 통과 확인**
+
+Run: `uv run pytest tests/agents/test_risk_tool.py -v`
+Expected: 3 passed
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add src/rent_agent/agents/risk_agent.py tests/agents
+git commit -m "feat: 규칙 기반 assess_jeonse_risk 도구와 위험 판단 에이전트
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 11: 시세 조회 에이전트 (market_agent.py)
+
+**Files:**
+- Create: `src/rent_agent/agents/market_agent.py`
+- Test: `tests/agents/test_market_tool.py`
+
+도구는 클라이언트를 주입받아야 테스트 가능하므로 **팩토리 함수 안에서 `@tool`을 만든다**(클로저).
+
+- [ ] **Step 1: 실패 테스트**
+
+`tests/agents/test_market_tool.py`:
+```python
+import json
+from datetime import date
+
+from rent_agent.agents.market_agent import make_market_tools, recent_deal_months
+from rent_agent.tools.molit_rent import MockMolitRentClient
+
+
+def test_recent_deal_months():
+    assert recent_deal_months(today=date(2026, 9, 2), months=3) == ["202609", "202608", "202607"]
+    assert recent_deal_months(today=date(2026, 1, 15), months=2) == ["202601", "202512"]
+
+
+def test_find_region_code_tool():
+    find_region_code, _ = make_market_tools(MockMolitRentClient())
+    out = json.loads(find_region_code.invoke({"query": "강남구"}))
+    assert out == [{"name": "서울특별시 강남구", "code": "11680"}]
+
+
+def test_get_recent_jeonse_deals_tool_with_mock():
+    _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
+    out = json.loads(
+        get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "apt_name": "까치마을", "area_m2": 39.6, "months": 1})
+    )
+    assert out["count"] == 1  # 픽스처: 까치마을 39.6㎡ 순수 전세 1건 (45,000)
+    assert out["median_deposit"] == 45000
+    assert out["recent"][0]["apt_name"] == "까치마을"
+    assert out["recent"][0]["deal_date"] == "2026-07-10"
+
+
+def test_get_recent_jeonse_deals_no_match():
+    _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
+    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "apt_name": "없는단지"}))
+    assert out["count"] == 0 and "message" in out
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `uv run pytest tests/agents/test_market_tool.py -v`
+Expected: FAIL — ModuleNotFoundError
+
+- [ ] **Step 3: 구현**
+
+`src/rent_agent/agents/market_agent.py`:
+```python
+"""시세 조회 에이전트: 법정동코드 조회 + 실거래가 API + 통계 요약."""
+
+import json
+from dataclasses import asdict
+from datetime import date
+
+from langchain.agents import create_agent
+from langchain_core.tools import BaseTool, tool
+
+from rent_agent.agents.llm import get_llm
+from rent_agent.agents.prompts import MARKET_PROMPT
+from rent_agent.config import Settings
+from rent_agent.tools.lawd_code import find_lawd_codes
+from rent_agent.tools.market_stats import summarize_jeonse
+from rent_agent.tools.molit_rent import (
+    MockMolitRentClient,
+    MolitApiError,
+    MolitRentClient,
+    RentClient,
+)
+
+
+def recent_deal_months(today: date | None = None, months: int = 3) -> list[str]:
+    """오늘부터 과거 months개월의 YYYYMM 목록 (최신 먼저)."""
+    today = today or date.today()
+    out: list[str] = []
+    y, m = today.year, today.month
+    for _ in range(months):
+        out.append(f"{y}{m:02d}")
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return out
+
+
+def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
+    @tool
+    def find_region_code(query: str) -> str:
+        """지역명(예: '강남구', '분당구', '서울')으로 실거래가 조회에 필요한 시군구 법정동코드(5자리)를 찾는다.
+        부분 일치 목록을 JSON [{name, code}]로 반환. 동(洞) 이름은 지원하지 않으니 구/시 단위로 질의한다."""
+        return json.dumps(
+            [{"name": n, "code": c} for n, c in find_lawd_codes(query)], ensure_ascii=False
+        )
+
+    @tool
+    def get_recent_jeonse_deals(
+        lawd_cd: str, apt_name: str | None = None, area_m2: float | None = None, months: int = 3
+    ) -> str:
+        """국토부 아파트 전월세 실거래가에서 최근 N개월 순수 전세(월세 0) 거래를 조회해 요약한다.
+        lawd_cd: find_region_code로 얻은 5자리 코드. apt_name: 단지명 일부(선택). area_m2: 전용면적 ㎡(선택, ±5㎡).
+        반환 JSON: count, median_deposit, min_deposit, max_deposit(만원), recent(최근 5건), months_queried."""
+        records = []
+        errors: list[str] = []
+        ymds = recent_deal_months(months=months)
+        for ymd in ymds:
+            try:
+                records.extend(client.fetch(lawd_cd, ymd))
+            except MolitApiError as e:
+                errors.append(f"{ymd}: {e}")
+        summary = summarize_jeonse(records, apt_name=apt_name, area_m2=area_m2)
+        payload: dict = {
+            "count": summary.count,
+            "median_deposit": summary.median_deposit,
+            "min_deposit": summary.min_deposit,
+            "max_deposit": summary.max_deposit,
+            "recent": [
+                {**asdict(r), "deal_date": r.deal_date.isoformat()} for r in summary.recent
+            ],
+            "months_queried": ymds,
+        }
+        if errors:
+            payload["errors"] = errors
+        if summary.count == 0:
+            payload["message"] = "조건에 맞는 순수 전세 거래가 없습니다. 단지명 표기나 면적, 조회 기간을 넓혀 보세요."
+        return json.dumps(payload, ensure_ascii=False)
+
+    return find_region_code, get_recent_jeonse_deals
+
+
+def get_rent_client(settings: Settings) -> RentClient:
+    if settings.molit_use_mock:
+        return MockMolitRentClient()
+    return MolitRentClient(settings.apartment_openapi_endpoint, settings.apartment_openapi_key_decoded)
+
+
+def build_market_agent(settings: Settings, client: RentClient | None = None):
+    tools = make_market_tools(client or get_rent_client(settings))
+    return create_agent(model=get_llm(settings), tools=list(tools), system_prompt=MARKET_PROMPT, name="market_agent")
+```
+
+- [ ] **Step 4: 통과 확인**
+
+Run: `uv run pytest tests/agents -v`
+Expected: 모두 passed
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add src/rent_agent/agents/market_agent.py tests/agents/test_market_tool.py
+git commit -m "feat: 실거래가 기반 시세 조회 에이전트 및 도구
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 12: 지식 QA·리포트 에이전트 + Supervisor 그래프
+
+**Files:**
+- Create: `src/rent_agent/agents/knowledge_agent.py`, `src/rent_agent/agents/report_agent.py`, `src/rent_agent/agents/supervisor.py`
+- Test: `tests/agents/test_knowledge_tool.py`, `tests/agents/test_graph_integration.py`
+
+- [ ] **Step 1: 실패 테스트 (지식 검색 도구는 Fake 임베딩으로)**
+
+`tests/agents/test_knowledge_tool.py`:
+```python
+from pathlib import Path
+
+from langchain_core.embeddings import DeterministicFakeEmbedding
+
+from rent_agent.agents.knowledge_agent import make_knowledge_tool
+from rent_agent.rag.ingest import build_vectorstore
+
+
+def test_search_tool_formats_sources(tmp_path: Path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.md").write_text(
+        "---\ntitle: 임대차법\nsource: https://law.go.kr\neffective_date: 2024-01-01\n---\n## 대항력\n전입신고 다음 날 효력.",
+        encoding="utf-8",
+    )
+    vs = build_vectorstore(raw, tmp_path / "chroma", DeterministicFakeEmbedding(size=32), "t", reset=True)
+    search = make_knowledge_tool(vs.as_retriever(search_kwargs={"k": 1}))
+    out = search.invoke({"query": "대항력"})
+    assert "[출처: 임대차법 | https://law.go.kr | 기준일 2024-01-01]" in out
+    assert "전입신고 다음 날 효력" in out
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `uv run pytest tests/agents/test_knowledge_tool.py -v`
+Expected: FAIL — ModuleNotFoundError
+
+- [ ] **Step 3: 구현**
+
+`src/rent_agent/agents/knowledge_agent.py`:
+```python
+"""지식 QA 에이전트: Chroma 검색 도구 + 근거 인용 프롬프트."""
+
+from langchain.agents import create_agent
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.tools import BaseTool, tool
+
+from rent_agent.agents.llm import get_llm
+from rent_agent.agents.prompts import KNOWLEDGE_PROMPT
+from rent_agent.config import Settings
+from rent_agent.rag.retriever import get_retriever
+
+
+def make_knowledge_tool(retriever: BaseRetriever) -> BaseTool:
+    @tool
+    def search_real_estate_knowledge(query: str) -> str:
+        """부동산 임대차 법령(주택임대차보호법), 소액임차인 최우선변제 기준, 전세사기 예방 체크리스트,
+        HUG 전세보증금반환보증, 청년·버팀목 전세대출 자료를 검색한다. 질문을 그대로 넣으면 관련 문단과 출처를 반환한다."""
+        docs = retriever.invoke(query)
+        if not docs:
+            return "관련 문서를 찾지 못했습니다."
+        return "\n\n---\n\n".join(
+            f"[출처: {d.metadata.get('title', '')} | {d.metadata.get('source', '')} | "
+            f"기준일 {d.metadata.get('effective_date', '')}]\n{d.page_content}"
+            for d in docs
+        )
+
+    return search_real_estate_knowledge
+
+
+def build_knowledge_agent(settings: Settings, retriever: BaseRetriever | None = None):
+    search = make_knowledge_tool(retriever or get_retriever(settings))
+    return create_agent(model=get_llm(settings), tools=[search], system_prompt=KNOWLEDGE_PROMPT, name="knowledge_agent")
+```
+
+`src/rent_agent/agents/report_agent.py`:
+```python
+"""리포트 에이전트: 도구 없음. 대화 내 다른 에이전트 결과만 종합한다."""
+
+from langchain.agents import create_agent
+
+from rent_agent.agents.llm import get_llm
+from rent_agent.agents.prompts import REPORT_PROMPT
+from rent_agent.config import Settings
+
+
+def build_report_agent(settings: Settings):
+    # 리포트는 약간의 문장 다양성이 읽기 좋아 temperature 0.3
+    return create_agent(model=get_llm(settings, temperature=0.3), tools=[], system_prompt=REPORT_PROMPT, name="report_agent")
+```
+
+`src/rent_agent/agents/supervisor.py`:
+```python
+"""Supervisor 그래프 조립. output_mode='full_history'인 이유: report_agent가 다른 에이전트의
+도구 결과(수치)를 직접 봐야 하고, UI에서 에이전트 호출 흐름을 그대로 보여 주기 위함."""
+
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph_supervisor import create_supervisor
+
+from rent_agent.agents.knowledge_agent import build_knowledge_agent
+from rent_agent.agents.llm import get_llm
+from rent_agent.agents.market_agent import build_market_agent
+from rent_agent.agents.prompts import SUPERVISOR_PROMPT
+from rent_agent.agents.report_agent import build_report_agent
+from rent_agent.agents.risk_agent import build_risk_agent
+from rent_agent.config import Settings
+
+
+def build_graph(settings: Settings, checkpointer: BaseCheckpointSaver | None = None):
+    agents = [
+        build_knowledge_agent(settings),
+        build_market_agent(settings),
+        build_risk_agent(settings),
+        build_report_agent(settings),
+    ]
+    workflow = create_supervisor(
+        agents,
+        model=get_llm(settings),
+        prompt=SUPERVISOR_PROMPT,
+        output_mode="full_history",
+        add_handoff_back_messages=True,
+        supervisor_name="supervisor",
+    )
+    return workflow.compile(checkpointer=checkpointer)
+```
+
+- [ ] **Step 4: 통합 테스트 (실제 OpenAI 호출, CI 제외)**
+
+`tests/agents/test_graph_integration.py`:
+```python
+"""실제 LLM을 호출한다. 실행: uv run pytest -m integration -s"""
+
+import os
+
+import pytest
+from langchain_core.messages import HumanMessage
+
+from rent_agent.agents.supervisor import build_graph
+from rent_agent.config import Settings
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def real_settings(monkeypatch):
+    for k in ("OPENAI_API_KEY", "APARTMENT_OPENAPI_KEY", "MOLIT_USE_MOCK", "LANGSMITH_TRACING"):
+        monkeypatch.delenv(k, raising=False)
+    s = Settings()  # .env 로드
+    if not s.openai_api_key or s.openai_api_key.startswith("sk-test"):
+        pytest.skip("OPENAI_API_KEY 필요")
+    if not os.path.exists(s.chroma_dir):
+        pytest.skip("먼저 scripts/ingest.py 실행")
+    return s
+
+
+def _agents_called(result) -> set[str]:
+    return {m.name for m in result["messages"] if getattr(m, "name", None)}
+
+
+def test_knowledge_question_routes_to_knowledge_agent(real_settings):
+    graph = build_graph(real_settings)
+    result = graph.invoke({"messages": [HumanMessage("전입신고하면 대항력은 언제부터 생기나요?")]})
+    assert "knowledge_agent" in _agents_called(result)
+    assert "risk_agent" not in _agents_called(result)
+    assert "다음 날" in result["messages"][-1].content or "익일" in result["messages"][-1].content
+
+
+def test_jeonse_diagnosis_calls_risk_and_report(real_settings):
+    graph = build_graph(real_settings)
+    prompt = (
+        "서울 강남구 까치마을 39.6㎡ 전세를 보려고 합니다. 보증금 4억 5천, 매매 시세 6억, "
+        "근저당 채권최고액 1억 2천, 자기자금 2억, 연소득 4천만원입니다. 괜찮은 계약인가요?"
+    )
+    result = graph.invoke({"messages": [HumanMessage(prompt)]})
+    called = _agents_called(result)
+    assert {"risk_agent", "report_agent"} <= called
+    final = result["messages"][-1].content
+    assert "종합 판정" in final
+    assert "위험" in final  # 전세가율 75%, 총 부담률 95% → 위험
+```
+
+Run: `uv run pytest tests/agents/test_knowledge_tool.py -v`
+Expected: 1 passed
+
+Run: `uv run pytest -m integration -v`
+Expected: 2 passed (약 1~2분, 소액 과금). LangSmith 프로젝트 `rent-agent`에 트레이스 생성 확인.
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add src/rent_agent/agents tests/agents
+git commit -m "feat: 지식 QA·리포트 에이전트 및 Supervisor 그래프 조립
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 13: Streamlit 앱
+
+**Files:**
+- Create: `src/rent_agent/app/__init__.py`, `src/rent_agent/app/streamlit_app.py`, `.streamlit/config.toml`
+
+- [ ] **Step 1: 구현**
+
+`src/rent_agent/app/__init__.py`: 빈 파일.
+
+`.streamlit/config.toml`:
+```toml
+[server]
+headless = true
+
+[theme]
+base = "light"
+```
+
+`src/rent_agent/app/streamlit_app.py`:
+```python
+"""Streamlit UI: (1) 지식 Q&A 채팅, (2) 전세 진단 폼. 둘 다 같은 Supervisor 그래프를 호출한다."""
+
+import uuid
+
+import streamlit as st
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
+
+from rent_agent.agents.supervisor import build_graph
+from rent_agent.config import get_settings
+
+st.set_page_config(page_title="rent-agent · 전세 리스크 상담", page_icon="🏠", layout="wide")
+
+
+@st.cache_resource
+def _graph():
+    return build_graph(get_settings(), checkpointer=InMemorySaver())
+
+
+def _run(prompt: str):
+    config = {"configurable": {"thread_id": st.session_state.thread_id}}
+    return _graph().invoke({"messages": [HumanMessage(prompt)]}, config=config)
+
+
+def _trace(result) -> list[str]:
+    """에이전트 호출 순서를 사람이 읽는 형태로. 포트폴리오 데모용 관측 정보."""
+    lines: list[str] = []
+    for m in result["messages"]:
+        name = getattr(m, "name", None)
+        if isinstance(m, AIMessage) and m.tool_calls:
+            for tc in m.tool_calls:
+                lines.append(f"🧭 {name or 'supervisor'} → {tc['name']}")
+        elif isinstance(m, ToolMessage) and name and not name.startswith("transfer_"):
+            lines.append(f"🔧 {name} 결과 수신")
+    return lines
+
+
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.chat = []
+
+st.title("🏠 rent-agent — 사회초년생 전세 상담")
+st.caption("법령·제도 질문과 전세 매물 위험 진단을 멀티에이전트가 처리합니다. 참고 정보이며 법률·금융 자문이 아닙니다.")
+
+tab_chat, tab_diag = st.tabs(["💬 지식 Q&A", "🔎 전세 진단"])
+
+with tab_chat:
+    for role, text in st.session_state.chat:
+        st.chat_message(role).markdown(text)
+    if q := st.chat_input("예: 전입신고하면 대항력은 언제부터 생기나요?"):
+        st.session_state.chat.append(("user", q))
+        st.chat_message("user").markdown(q)
+        with st.chat_message("assistant"), st.spinner("에이전트가 답변을 준비 중..."):
+            result = _run(q)
+            answer = result["messages"][-1].content
+            st.markdown(answer)
+            with st.expander("에이전트 실행 흐름"):
+                st.write("\n".join(_trace(result)) or "(추적 정보 없음)")
+        st.session_state.chat.append(("assistant", answer))
+
+with tab_diag:
+    with st.form("diag"):
+        c1, c2, c3 = st.columns(3)
+        region_text = c1.text_input("지역 (구/시)", "강남구")
+        apt = c2.text_input("단지명", "")
+        area = c3.number_input("전용면적 (㎡)", min_value=0.0, value=0.0, step=0.1)
+        c4, c5, c6 = st.columns(3)
+        deposit = c4.number_input("전세 보증금 (만원)", min_value=0, value=30000, step=500)
+        price = c5.number_input("매매 시세 (만원)", min_value=0, value=50000, step=500)
+        liens = c6.number_input("선순위 근저당 채권최고액 (만원)", min_value=0, value=0, step=500)
+        c7, c8, c9 = st.columns(3)
+        senior_dep = c7.number_input("선순위 임차보증금 (만원, 다가구)", min_value=0, value=0, step=500)
+        capital = c8.number_input("자기자금 (만원)", min_value=0, value=0, step=500)
+        income = c9.number_input("연소득 (만원, 선택)", min_value=0, value=0, step=100)
+        rate = st.slider("전세대출 예상 금리 (%)", 0.0, 10.0, 3.5, 0.1)
+        submitted = st.form_submit_button("진단하기", type="primary")
+
+    if submitted:
+        if deposit == 0 or price == 0:
+            st.error("보증금과 매매 시세는 필수입니다.")
+        else:
+            parts = [f"{region_text} {apt} {f'{area}㎡' if area else ''} 전세 계약을 검토 중입니다."]
+            parts.append(f"보증금 {deposit}만원, 매매 시세 {price}만원, 선순위 근저당 채권최고액 {liens}만원, "
+                         f"선순위 임차보증금 {senior_dep}만원, 자기자금 {capital}만원, "
+                         f"{'연소득 ' + str(income) + '만원, ' if income else ''}예상 금리 {rate}%.")
+            if apt:
+                parts.append("같은 단지 최근 전세 시세와도 비교해 주세요.")
+            parts.append("이 계약이 적절한지 판단하고 리포트를 작성해 주세요.")
+            with st.spinner("시세 조회 · 위험 계산 · 리포트 작성 중..."):
+                result = _run(" ".join(parts))
+            st.markdown(result["messages"][-1].content)
+            with st.expander("에이전트 실행 흐름"):
+                st.write("\n".join(_trace(result)) or "(추적 정보 없음)")
+```
+
+- [ ] **Step 2: 수동 실행 확인**
+
+Run: `uv run streamlit run src/rent_agent/app/streamlit_app.py`
+확인 항목:
+1. 지식 Q&A 탭에서 "계약갱신요구권은 몇 번 쓸 수 있나요?" → 근거 출처 포함 답변, 실행 흐름에 `knowledge_agent`.
+2. 전세 진단 탭 기본값 + 단지명 "까치마을", 면적 39.6 → "## 종합 판정" 리포트, 시세 비교 문단 포함, 실행 흐름에 `market_agent`·`risk_agent`·`report_agent`.
+3. LangSmith 대시보드에 트레이스 확인.
+
+- [ ] **Step 3: 커밋**
+
+```bash
+git add src/rent_agent/app .streamlit
+git commit -m "feat: Streamlit UI (지식 Q&A 채팅 + 전세 진단 폼 + 에이전트 흐름 표시)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 14: RAGAS 평가 데이터셋 + 스크립트
+
+**Files:**
+- Create: `eval/dataset.jsonl`, `scripts/eval_rag.py`, `eval/results/.gitkeep`
+
+**근거:** 지식 QA 품질을 숫자로 보여야 "RAG를 썼다"를 넘어 "RAG를 검증했다"가 된다. 지표 3개 선택 이유 — Faithfulness(답이 검색 문서에 근거하는가: 환각 방지가 법령 QA의 핵심), AnswerRelevancy(질문에 맞게 답했는가), ContextPrecision(검색이 정답 관련 문서를 상위에 올렸는가: 리트리버 품질).
+
+- [ ] **Step 1: 데이터셋 작성 (data/raw 문서에서 답이 나오는 질문 10개)**
+
+`eval/dataset.jsonl` — 각 줄 `{"question": ..., "reference": ...}`. reference는 문서 내용에 근거한 정답 요지. 예시 10개(문서 최종 내용에 맞게 수치 확인):
+```jsonl
+{"question": "전입신고를 하면 대항력은 언제부터 생기나요?", "reference": "주택 인도와 전입신고를 마친 다음 날 0시부터 대항력이 발생한다."}
+{"question": "우선변제권을 갖기 위한 요건은 무엇인가요?", "reference": "대항력 요건(인도+전입신고)을 갖추고 임대차계약서에 확정일자를 받아야 한다."}
+{"question": "계약갱신요구권은 몇 번, 얼마 동안 행사할 수 있나요?", "reference": "1회에 한해 행사할 수 있고 갱신되는 임대차 존속기간은 2년이다."}
+{"question": "전세 보증금 증액 상한은 얼마인가요?", "reference": "약정 차임이나 보증금의 5%를 초과해 증액할 수 없다."}
+{"question": "서울에서 소액임차인으로 최우선변제를 받을 수 있는 보증금 기준과 변제 한도는?", "reference": "보증금 1억6,500만원 이하이면 5,500만원까지 최우선변제를 받을 수 있다."}
+{"question": "HUG 전세보증금반환보증에 가입하려면 전세가율이 얼마 이하여야 하나요?", "reference": "2023년 5월 이후 신규 가입은 전세가율 90% 이하여야 한다."}
+{"question": "전세 계약 전에 등기부등본에서 무엇을 확인해야 하나요?", "reference": "갑구에서 소유자·가압류·신탁 여부, 을구에서 근저당 채권최고액 등 선순위 권리를 확인한다."}
+{"question": "임대인의 세금 체납 여부는 어떻게 확인할 수 있나요?", "reference": "임대인에게 국세·지방세 납세증명서(완납증명)를 요구할 수 있고, 계약 전 임대인 정보 제시 의무가 있다."}
+{"question": "청년전용 버팀목 전세자금대출의 연령 요건은?", "reference": "만 19세 이상 34세 이하 무주택 세대주(예비 세대주 포함)."}
+{"question": "임차권등기명령은 언제 신청하나요?", "reference": "임대차가 종료됐는데 보증금을 돌려받지 못한 경우 임차인이 단독으로 신청하며, 이사 후에도 대항력과 우선변제권이 유지된다."}
+```
+
+`eval/results/.gitkeep`: 빈 파일.
+
+- [ ] **Step 2: 평가 스크립트**
+
+`scripts/eval_rag.py`:
+```python
+"""RAGAS로 지식 QA(RAG) 품질 평가. 실행: uv run python scripts/eval_rag.py
+지표: faithfulness, answer_relevancy, context_precision. 결과는 eval/results/<날짜>.json + .md"""
+
+import asyncio
+import json
+from datetime import datetime
+from pathlib import Path
+from statistics import mean
+
+from langchain_core.messages import HumanMessage
+from openai import AsyncOpenAI
+from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
+from ragas.llms import llm_factory
+from ragas.metrics.collections import AnswerRelevancy, ContextPrecision, Faithfulness
+
+from rent_agent.agents.knowledge_agent import build_knowledge_agent
+from rent_agent.config import get_settings
+from rent_agent.rag.retriever import get_retriever
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+async def main() -> None:
+    settings = get_settings()
+    retriever = get_retriever(settings)
+    agent = build_knowledge_agent(settings, retriever)
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    judge = llm_factory(settings.openai_model, client=client)
+    emb = RagasOpenAIEmbeddings(client=client, model=settings.openai_embedding_model)
+    faith, relev, prec = Faithfulness(llm=judge), AnswerRelevancy(llm=judge, embeddings=emb), ContextPrecision(llm=judge)
+
+    rows = [json.loads(line) for line in (ROOT / "eval" / "dataset.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    results = []
+    for row in rows:
+        contexts = [d.page_content for d in retriever.invoke(row["question"])]
+        answer = agent.invoke({"messages": [HumanMessage(row["question"])]})["messages"][-1].content
+        f = await faith.ascore(user_input=row["question"], response=answer, retrieved_contexts=contexts)
+        r = await relev.ascore(user_input=row["question"], response=answer)
+        p = await prec.ascore(user_input=row["question"], reference=row["reference"], retrieved_contexts=contexts)
+        results.append({**row, "answer": answer, "faithfulness": f.value, "answer_relevancy": r.value, "context_precision": p.value})
+        print(f"[{len(results)}/{len(rows)}] F={f.value:.2f} R={r.value:.2f} P={p.value:.2f}  {row['question']}")
+
+    summary = {k: round(mean(x[k] for x in results), 3) for k in ("faithfulness", "answer_relevancy", "context_precision")}
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    out_dir = ROOT / "eval" / "results"
+    (out_dir / f"{stamp}.json").write_text(json.dumps({"summary": summary, "rows": results}, ensure_ascii=False, indent=2), encoding="utf-8")
+    md = [f"# RAG 평가 결과 {stamp}", "", f"모델: {settings.openai_model} / 임베딩: {settings.openai_embedding_model} / k={settings.retriever_k}", "",
+          "| 지표 | 평균 |", "|---|---|", *[f"| {k} | {v} |" for k, v in summary.items()], "",
+          "| 질문 | F | R | P |", "|---|---|---|---|",
+          *[f"| {x['question']} | {x['faithfulness']:.2f} | {x['answer_relevancy']:.2f} | {x['context_precision']:.2f} |" for x in results]]
+    (out_dir / f"{stamp}.md").write_text("\n".join(md), encoding="utf-8")
+    print("\n요약:", summary)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+- [ ] **Step 3: 실행**
+
+Run: `uv run python scripts/eval_rag.py`
+Expected: 10줄 진행 출력 후 `요약: {'faithfulness': 0.x, ...}`. `eval/results/2026-09-xx.md` 생성. faithfulness가 0.8 미만이면 프롬프트/청킹 조정 대상으로 README에 기록.
+
+- [ ] **Step 4: 커밋 (md 결과 포함, json은 gitignore)**
+
+```bash
+git add eval scripts/eval_rag.py
+git commit -m "feat: RAGAS 기반 RAG 평가 스크립트 및 평가 데이터셋
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 15: ADR 문서
+
+**Files:**
+- Create: `docs/adr/README.md`, `docs/adr/0001-llm-openai.md` … `0006-uv-python312-streamlit.md`
+
+공통 템플릿:
+```markdown
+# ADR-000N: 제목
+
+- 상태: 채택
+- 날짜: 2026-09-02
+
+## 상황
+## 결정
+## 근거
+## 검토한 대안
+## 결과/트레이드오프
+```
+
+- [ ] **Step 1: 작성**
+
+`docs/adr/README.md`: ADR 목록 표(번호·제목·상태).
+
+- `0001-llm-openai.md`: 결정 OpenAI gpt-4.1-mini + text-embedding-3-small. 근거: langchain 생태계 1급 지원, tool calling 안정성, 한국어 품질, 비용(mini). 대안: Claude(문서 이해 강점, 비용 상승), Ollama(무료지만 한국어·속도·tool calling 신뢰도). 결과: 모델명은 `OPENAI_MODEL` 환경변수로 교체 가능하게 격리.
+- `0002-vector-store-chroma.md`: 결정 Chroma 로컬 persist. 근거: 수십~수백 청크 규모, 메타데이터 필터 지원, 서버 불필요. 대안: FAISS(메타데이터 약함), pgvector(운영형이지만 Docker 부담). 결과: 확장 시 `rag/retriever.py`만 교체.
+- `0003-multi-agent-supervisor.md`: 결정 `langgraph-supervisor` 패턴 + 4 워커. 근거: 역할 분리로 프롬프트 단순화·개별 테스트·트레이스 가독성, 핸드오프 도구 자동 생성. **위험 판단은 LLM이 아닌 순수 함수**로 두어 재현성·테스트 가능성 확보. `output_mode=full_history` 선택 이유(리포트 에이전트가 수치 원본을 봐야 함). 대안: 단일 ReAct 에이전트(도구 많아지면 라우팅 품질 저하), Swarm(피어 핸드오프, 흐름 예측 어려움). 트레이드오프: 호출 수 증가로 지연·비용 상승.
+- `0004-jeonse-risk-rules.md`: Task 3의 기준표(전세가율 70/80/90, 부담률 80/90/100, 낙찰가율 0.8 가정, 소액임차인 표, 주거비 30%)와 출처 URL, 한계(아파트 외 유형, 낙찰가율 지역 편차, 신탁·가압류 미반영).
+- `0005-ragas-langchain-community-pin.md`: ragas 0.4.3이 `langchain_community.chat_models.vertexai`를 하드 import → community 0.4.x에서 제거됨. 0.3.31 고정으로 해결(langchain 1.3.18과 호환 확인 2026-09-02). 대안: ragas 미사용·자체 LLM-judge 구현(재현성↑, 공인 지표 신뢰↓), 평가 전용 별도 venv(운영 복잡). 결과: langchain-community를 직접 사용하지 않으므로 런타임 영향 없음. ragas 상위 수정 시 핀 해제.
+- `0006-uv-python312-streamlit.md`: uv(lock 재현성·속도), Python 3.12(라이브러리 호환 최광범위, 3.13은 일부 C 확장 미지원), Streamlit(파이썬 단일 스택으로 데모 속도, 대안 FastAPI+React는 포트폴리오 범위 대비 과함).
+
+- [ ] **Step 2: 커밋**
+
+```bash
+git add docs/adr
+git commit -m "docs: 설계 결정 기록(ADR) 6건
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 16: GitHub Actions CI + README 마무리 + 푸시
+
+**Files:**
+- Create: `.github/workflows/ci.yml`
+- Modify: `README.md` (평가 결과·ADR 링크·프로젝트 구조 섹션 추가)
+
+- [ ] **Step 1: CI 워크플로**
+
+`.github/workflows/ci.yml`:
+```yaml
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -q
+        env:
+          OPENAI_API_KEY: sk-ci-dummy
+          APARTMENT_OPENAPI_KEY: dummy
+          MOLIT_USE_MOCK: "true"
+          LANGSMITH_TRACING: "false"
+```
+
+Run: `uv run ruff format . && uv run ruff check . && uv run pytest -q`
+Expected: 포맷 적용, 린트 통과, 유닛 테스트 전부 passed (integration 제외).
+
+- [ ] **Step 2: README 보강**
+
+`README.md`에 추가:
+- "프로젝트 구조" 섹션 (본 계획 1장의 트리 요약)
+- "설계 결정" 섹션: ADR 6건 링크 + 각 한 줄 요약
+- "RAG 평가 결과" 섹션: `eval/results/<날짜>.md` 요약 표 복사
+- "에이전트 동작 예시" 섹션: 진단 질문 1개 → 실행 흐름(에이전트 순서) + 리포트 일부 캡처(텍스트)
+- "한계와 다음 단계": 매매·월세 확장, 등기부등본 파싱, 전국 법정동코드, 매매 실거래가 API로 시세 자동화, 낙찰가율 지역별 데이터화
+
+- [ ] **Step 3: 커밋 & 푸시 & CI 확인**
+
+```bash
+git add .github README.md
+git commit -m "ci: GitHub Actions(ruff+pytest) 및 README 보강
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+git push
+gh run watch --exit-status
+```
+Expected: 워크플로 성공. `gh run list --limit 1` 상태 `completed success`.
+
+---
+
+## 3. Self-Review 체크
+
+- **범위 커버리지:** 지식 QA(RAG) → Task 7·8·12 / 전세 판단 → Task 3·10 / 시세(실거래가) → Task 4·5·6·11 / 멀티에이전트 → Task 12 / Streamlit → Task 13 / LangSmith → `.env` + Task 12 확인 단계 / RAGAS → Task 14 / pytest → 전 Task / GitHub 연동+CI → Task 1·16 / 결정 근거 → Task 15 ADR + 각 파일 docstring.
+- **타입 일관성:** `RentRecord` 필드(apt_name, dong, area_m2, floor, build_year, deal_date, deposit, monthly_rent, contract_type, renewal_right_used)가 Task 5·6·11에서 동일. `JeonseInput`/`RiskAssessment` 필드가 Task 3·10에서 동일. `build_vectorstore(raw_dir, chroma_dir, embedding, collection, reset)` 시그니처가 Task 8·12에서 동일. `Region` 값(seoul/metro_over/metro_city/other)이 Task 3·9 프롬프트·10에서 동일. 소액임차인 수치가 Task 3 코드·Task 7 문서·Task 14 데이터셋에서 동일(16,500/5,500).
+- **알려진 주의점:** (1) `gpt-4.1-mini` 모델명이 계정에서 불가하면 `.env`의 `OPENAI_MODEL`만 바꾼다. (2) 실거래가 API는 아파트만 다룬다(오피스텔·빌라 제외) — UI 캡션과 MARKET_PROMPT에 명시됨. (3) 매매 시세는 사용자 입력이다. 매매 실거래가 API(RTMSDataSvcAptTrade)를 추가 신청하면 자동화 가능 — "다음 단계"에 기록.
