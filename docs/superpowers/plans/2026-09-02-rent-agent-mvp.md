@@ -1966,7 +1966,7 @@ def test_build_vectorstore_persists_and_searches(tmp_path: Path):
     emb = DeterministicFakeEmbedding(size=64)
     vs = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="test_col", reset=True)
     n = vs._collection.count()
-    assert n >= 4
+    assert n >= 3  # 서문 + 2개 ## 섹션 (섹션 = 청크; chunk_size 1000에서는 분할되지 않음)
     # 디스크에서 다시 열어도 같은 개수 → 실제로 persist 됨
     reopened = Chroma(collection_name="test_col", embedding_function=emb, persist_directory=str(chroma_dir))
     assert reopened._collection.count() == n
@@ -3808,7 +3808,7 @@ KNOWLEDGE_PROMPT(Task 9 블록)에 "각 조건을 해당 상품에만 귀속" �
 1. `rag/ingest.py`의 `split_documents` 기본 `chunk_size`를 800 → **1000**(`DEFAULT_CHUNK_SIZE`, Task 8 블록 반영). 가장 긴 섹션이 ≈950자라 모든 `##` 섹션이 한 청크가 된다.
 2. `tests/rag/test_ingest.py::test_real_corpus_chunking_is_stable`에 "(file, section) 중복 없음" 단언 추가(Task 8 블록 반영) — 섹션 분할 회귀 방지.
 3. 재적재 → 5차 평가. Q9 컨텍스트에 섹션 ② 본문(병역 예외 포함)이 들어오는지 확인.
-README에는 최종(5차) 수치와 1→5차 변화·해석을 기록한다. n=10이라 ±0.05는 판정 변동 범위임을 명시. P는 k 변경 전후를 비교하지 않는다.
+**5차(최종) 결과: F 0.914 / R 0.391 / P 0.886 (k=6), 53 청크.** Q9 F 0.57→0.71, 답이 섹션 ② 본문("복무기간 차감") 근거로 생성됨. P는 같은 k=6인 4차 대비 0.832→0.886 상승(전체 섹션이 조각 청크를 대체). README에는 최종(5차) 수치와 1→5차 변화·해석을 기록한다. n=10이라 ±0.05는 판정 변동 범위임을 명시. P는 k 변경 전후를 비교하지 않는다.
 
 - [ ] **Step 4: 커밋 (md 결과 포함, json은 gitignore)**
 
