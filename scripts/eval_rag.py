@@ -37,9 +37,9 @@ async def main() -> None:
 
     # 평가자(judge) LLM은 피평가 에이전트와 같은 모델을 쓴다. 별도 모델을 쓰면
     # 점수 차이가 "RAG 품질"인지 "judge 성향"인지 구분되지 않는다.
-    # max_tokens: ragas 기본값 1024로는 한국어 법령 청크에 대한 NLI verdict JSON이 잘려
-    # instructor가 IncompleteOutputException을 던진다(ragas/llms/base.py 권고대로 4096으로 올림).
     client = AsyncOpenAI(api_key=settings.openai_api_key)
+    # 기본 max_tokens=1024는 한국어 법령 청크의 NLI 판정 JSON이 잘려
+    # IncompleteOutputException (실측)
     judge = llm_factory(settings.openai_model, client=client, max_tokens=4096)
     emb = RagasOpenAIEmbeddings(client=client, model=settings.openai_embedding_model)
     faith = Faithfulness(llm=judge)
