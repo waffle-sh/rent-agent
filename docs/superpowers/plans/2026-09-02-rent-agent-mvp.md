@@ -886,7 +886,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `src/rent_agent/tools/__init__.py`, `src/rent_agent/tools/lawd_code.py`
 - Test: `tests/tools/__init__.py`, `tests/tools/test_lawd_code.py`
 
-실거래가 API는 `LAWD_CD`(법정동코드 앞 5자리 = 시군구)를 요구한다. MVP는 서울 25개 자치구 + 경기 주요 시를 내장 dict로 두고, 이후 행안부 법정동코드 전체 파일로 확장한다(ADR에 기록).
+실거래가 API는 `LAWD_CD`(법정동코드 앞 5자리 = 시군구)를 요구한다. MVP는 서울 25개 자치구 + 경기 주요 시를 내장 dict로 두고, 이후 행안부 법정동코드 전체 파일로 확장한다(README 다음 단계에 기록).
+
+**주의 (2026-09-02 API 실측):** 일반구가 있는 시는 **구 단위 코드로만** 데이터가 나온다. 부천시는 2024-01-01 원미·소사·오정구를 부활시켰고(41190은 0건), 화성시는 2025-01-01 만세·효행·병점·동탄구를 신설했다(41590은 0건). 정적 dict는 이런 행정구역 개편에 취약하므로 docstring에 검증일을 남기고, 통합 테스트로 전 코드가 1건 이상 반환하는지 확인한다.
 
 - [ ] **Step 1: 실패 테스트**
 
@@ -911,8 +913,29 @@ def test_dong_name_not_supported_returns_empty():
     assert find_lawd_codes("역삼동") == []
 
 
-def test_whitespace_and_suffix_tolerant():
+def test_whitespace_tolerant():
     assert find_lawd_codes(" 강남 ") == [("서울특별시 강남구", "11680")]
+
+
+def test_multi_token_query_requires_all_tokens():
+    # 사용자는 "서울 강남구", "성남 분당"처럼 띄어 쓴다 — 모든 토큰이 이름에 포함되면 매칭
+    assert find_lawd_codes("서울 강남구") == [("서울특별시 강남구", "11680")]
+    assert find_lawd_codes("성남 분당") == [("경기도 성남시 분당구", "41135")]
+    assert find_lawd_codes("부산 중구") == []
+
+
+def test_city_with_districts_returns_all_districts():
+    assert len(find_lawd_codes("성남시")) == 3
+    assert len(find_lawd_codes("부천")) == 3
+    assert len(find_lawd_codes("화성")) == 4
+
+
+def test_codes_are_unique_five_digits():
+    from rent_agent.tools.lawd_code import LAWD_CODES
+
+    codes = list(LAWD_CODES.values())
+    assert len(codes) == len(set(codes)) == 50
+    assert all(len(c) == 5 and c.isdigit() for c in codes)
 ```
 
 - [ ] **Step 2: 실패 확인**
@@ -928,7 +951,11 @@ Expected: FAIL — ModuleNotFoundError
 ```python
 """시군구 법정동코드(5자리) 조회. 출처: 행정안전부 법정동코드 (https://www.code.go.kr).
 
-MVP 범위: 서울 25개 자치구 + 경기 주요 시. 전체 코드는 행안부 파일을 CSV로 내려받아 확장 가능.
+MVP 범위: 서울 25개 자치구 + 경기 주요 시(50개). 전체 코드는 행안부 파일을 CSV로 내려받아 확장 가능.
+
+주의: 일반구가 있는 시(수원·성남·고양·용인·안양·부천·화성)는 국토부 실거래가 API가 **구 단위 코드**만 인식한다.
+부천시(2024-01 구 부활), 화성시(2025-01 구 신설)처럼 행정구역 개편이 있으면 시 코드는 0건을 반환한다.
+전 코드가 실거래가 API에서 1건 이상 반환하는지 2026-09-02 확인함 (tests/tools/test_lawd_code_live.py 로 재검증).
 """
 
 LAWD_CODES: dict[str, str] = {
@@ -970,10 +997,15 @@ LAWD_CODES: dict[str, str] = {
     "경기도 용인시 처인구": "41461",
     "경기도 용인시 기흥구": "41463",
     "경기도 용인시 수지구": "41465",
-    "경기도 부천시": "41190",
+    "경기도 부천시 원미구": "41192",
+    "경기도 부천시 소사구": "41194",
+    "경기도 부천시 오정구": "41196",
     "경기도 안양시 만안구": "41171",
     "경기도 안양시 동안구": "41173",
-    "경기도 화성시": "41590",
+    "경기도 화성시 만세구": "41591",
+    "경기도 화성시 효행구": "41593",
+    "경기도 화성시 병점구": "41595",
+    "경기도 화성시 동탄구": "41597",
     "경기도 하남시": "41450",
     "경기도 광명시": "41210",
     "경기도 과천시": "41290",
@@ -981,17 +1013,40 @@ LAWD_CODES: dict[str, str] = {
 
 
 def find_lawd_codes(query: str) -> list[tuple[str, str]]:
-    """지역명 부분 일치로 (정식 명칭, 코드) 목록 반환. 동(洞) 단위는 지원하지 않는다."""
-    q = query.strip()
-    if not q:
+    """지역명으로 (정식 명칭, 코드) 목록 반환. 공백으로 나눈 모든 토큰이 이름에 포함되면 매칭.
+    "서울 강남구" → 강남구, "성남 분당" → 분당구, "수원" → 수원시 4개 구. 동(洞) 단위는 지원하지 않는다."""
+    tokens = query.split()
+    if not tokens:
         return []
-    return [(name, code) for name, code in LAWD_CODES.items() if q in name]
+    return [(name, code) for name, code in LAWD_CODES.items() if all(t in name for t in tokens)]
 ```
+
+`tests/tools/test_lawd_code_live.py` (통합 테스트 — 실제 API로 전 코드 검증. 행정구역 개편 감지용):
+```python
+"""실행: uv run pytest -m integration tests/tools/test_lawd_code_live.py"""
+
+import pytest
+
+from rent_agent.config import PROJECT_ROOT, Settings
+from rent_agent.tools.lawd_code import LAWD_CODES
+from rent_agent.tools.molit_rent import HousingType, MolitRentClient
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize("name,code", list(LAWD_CODES.items()))
+def test_every_code_returns_apartment_rent_data(name, code):
+    s = Settings(_env_file=PROJECT_ROOT / ".env")
+    client = MolitRentClient({HousingType.APARTMENT: s.apartment_openapi_endpoint}, s.apartment_openapi_key_decoded)
+    records = client.fetch(code, "202607", num_of_rows=1)
+    assert records, f"{name}({code}) 실거래 0건 — 행정구역 개편으로 코드가 바뀌었을 수 있음"
+```
+이 파일은 `MolitRentClient`가 생기는 **Task 5에서 추가**한다(Task 5 커밋에 포함).
 
 - [ ] **Step 4: 통과 확인**
 
 Run: `uv run pytest tests/tools/test_lawd_code.py -v`
-Expected: 4 passed
+Expected: 7 passed
 
 - [ ] **Step 5: 커밋**
 
@@ -1008,7 +1063,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `src/rent_agent/tools/molit_rent.py`, `tests/fixtures/rent_response.xml`, `tests/fixtures/rent_response_rh.xml`, `tests/fixtures/rent_response_offi.xml`, `tests/fixtures/rent_error.xml`
-- Test: `tests/tools/test_molit_rent.py`
+- Test: `tests/tools/test_molit_rent.py`, `tests/tools/test_lawd_code_live.py` (Task 4에 정의된 통합 테스트 — 여기서 파일 생성)
 
 **배경 (2026-09-02 실측):** 국토부 전월세 실거래가 API는 주거 유형별로 서비스가 나뉜다. 세 API 모두 같은 서비스 키, 같은 파라미터(`LAWD_CD`, `DEAL_YMD`, `pageNo`, `numOfRows`), 같은 XML 골격을 쓰고 **건물명 필드만 다르다**. 사회초년생 임차 수요는 빌라·오피스텔이 많아 세 유형을 모두 지원한다.
 
@@ -1400,10 +1455,13 @@ for t in HousingType:
 ```
 Expected: 세 줄 출력(`apartment 2 ...`, `multi_house 2 ...`, `officetel 2 ...`). `MolitApiError`가 나면 `.env`의 키/엔드포인트 확인.
 
+Run: `uv run pytest -m integration tests/tools/test_lawd_code_live.py -q`
+Expected: 50 passed (전 법정동코드가 실거래 데이터를 반환).
+
 - [ ] **Step 7: 커밋**
 
 ```bash
-git add src/rent_agent/tools/molit_rent.py tests/tools/test_molit_rent.py tests/fixtures
+git add src/rent_agent/tools/molit_rent.py tests/tools/test_molit_rent.py tests/tools/test_lawd_code_live.py tests/fixtures
 git commit -m "feat: 국토부 전월세 실거래가 클라이언트 (아파트·연립다세대·오피스텔) 및 XML 파서
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
