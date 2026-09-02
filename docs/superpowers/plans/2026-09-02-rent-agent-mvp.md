@@ -400,7 +400,8 @@ class Settings(BaseSettings):
     raw_docs_dir: Path = PROJECT_ROOT / "data" / "raw"
     chroma_dir: Path = PROJECT_ROOT / "data" / "chroma"
     chroma_collection: str = "real_estate_knowledge"
-    retriever_k: int = 4
+    # 54청크 코퍼스에서 상품 비교형 질의는 관련 섹션이 4~6개라 k=4는 정답 섹션을 밀어냄 (RAGAS Q9 실측). ADR-0002
+    retriever_k: int = 6
 
     # LangSmith (환경변수만 있으면 langchain이 자동 트레이싱)
     langsmith_api_key: str | None = None
@@ -3782,7 +3783,16 @@ Expected: Q4의 context_precision > 0.25, 5% 조문이 컨텍스트에 포함; f
 **2차 결과 (2026-09-02): F 0.822 / R 0.414 / P 0.950.** Q4는 P 1.00으로 해결. Q9(청년 버팀목 연령)에서 F 1.00→0.57: 답이 중소기업취업청년 대출의 "병역 이행자 만 39세" 예외를 청년전용 버팀목 조건으로 귀속(1·2차 모두 같은 답, 2차 판정자가 잡음). 검색은 정상(P 1.00) → 귀속 오류. 나머지 하락(Q1·Q3·Q8·Q10)은 정답인 답의 부연 설명에 대한 판정 엄격도 차이(검색 불변인데 P가 움직인 Q1이 증거).
 
 - [ ] **Step 3c: 상품 간 조건 혼용 금지 지시 후 3차 평가**
-KNOWLEDGE_PROMPT(Task 9 블록)에 "각 조건을 해당 상품에만 귀속" 지시 추가 → `prompts.py` 동기화 → `scripts/eval_rag.py` 재실행(재적재 불필요). README에는 최종(3차) 수치와 1→3차 변화·해석을 기록한다. n=10이라 ±0.05는 판정 변동 범위임을 명시.
+KNOWLEDGE_PROMPT(Task 9 블록)에 "각 조건을 해당 상품에만 귀속" 지시 추가 → `prompts.py` 동기화 → `scripts/eval_rag.py` 재실행(재적재 불필요).
+
+**3차 결과: F 0.902 / R 0.392 / P 0.950.** Q9 답은 2차와 동일("병역 이행 시 만 39세")인데 판정만 0.57→1.00 — 프롬프트로는 바뀌지 않았다. 원인 재추적: 정답 섹션 `## ② 청년전용 버팀목`이 유사도 순위 6~7위(두 청크로 분할)라 top-4에 없고, 비교표(1위)·중기청(2위)·공통 요건(3위)·일반(4위)만 컨텍스트에 들어옴. **그리고 문서 ②에도 병역 예외가 명시되어 있어 모델의 답은 문서와 일치** — 데이터셋 reference가 예외를 빠뜨린 것이 판정 불일치의 원인.
+
+- [ ] **Step 3d: 검색 커버리지·정답 기준 수정 후 4차(최종) 평가**
+1. `eval/dataset.jsonl` Q9 reference: "만 19세 이상 34세 이하 무주택 세대주(예비 세대주 포함). 병역 의무를 이행한 경우 복무기간(최대 6년)을 차감해 만 39세까지 인정하는 예외가 있다." (문서 ② 본문과 일치).
+2. `data/raw/05-youth-jeonse-loan.md` 섹션 헤더 `## ② 청년전용 버팀목 전세자금` → `## ② 청년전용 버팀목 전세자금 — 연령·소득·한도 요건` (질의 어휘 매칭; 사실 변경 없음). 비교표 헤더는 유지.
+3. `retriever_k` 기본값 4 → 6 (`config.py`, Task 2 블록 반영). 근거: 54청크 코퍼스에서 상품 비교형 질의는 관련 섹션이 4~6개.
+4. `uv run python scripts/ingest.py` 재적재 → `scripts/eval_rag.py` 4차 실행. Q9 컨텍스트에 섹션 ②가 포함되는지 확인.
+README에는 최종(4차) 수치와 1→4차 변화·해석을 기록한다. n=10이라 ±0.05는 판정 변동 범위임을 명시.
 
 - [ ] **Step 4: 커밋 (md 결과 포함, json은 gitignore)**
 
@@ -3819,7 +3829,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 `docs/adr/README.md`: ADR 목록 표(번호·제목·상태).
 
 - `0001-llm-openai.md`: 결정 OpenAI gpt-4.1-mini + text-embedding-3-small. 근거: langchain 생태계 1급 지원, tool calling 안정성, 한국어 품질, 비용(mini). 대안: Claude(문서 이해 강점, 비용 상승), Ollama(무료지만 한국어·속도·tool calling 신뢰도). 결과: 모델명은 `OPENAI_MODEL` 환경변수로 교체 가능하게 격리.
-- `0002-vector-store-chroma.md`: 결정 Chroma 로컬 persist. 근거: 수십~수백 청크 규모, 메타데이터 필터 지원, 서버 불필요. 대안: FAISS(메타데이터 약함), pgvector(운영형이지만 Docker 부담). 결과: 확장 시 `rag/retriever.py`만 교체. **검색 전략 결정도 함께 기록**: 헤더 우선 분할(서문+첫 조문 병합으로 대항력 질의 1위 상실 실측), `## 출처` 제외, MMR 대신 단순 유사도(비중복 코퍼스에서 MMR이 관련 청크를 밀어냄 — 4개 질의 실측 표 포함), 결정적 id 업서트.
+- `0002-vector-store-chroma.md`: 결정 Chroma 로컬 persist. 근거: 수십~수백 청크 규모, 메타데이터 필터 지원, 서버 불필요. 대안: FAISS(메타데이터 약함), pgvector(운영형이지만 Docker 부담). 결과: 확장 시 `rag/retriever.py`만 교체. **검색 전략 결정도 함께 기록**: 헤더 우선 분할(서문+첫 조문 병합으로 대항력 질의 1위 상실 실측), `## 출처` 제외, MMR 대신 단순 유사도(비중복 코퍼스에서 MMR이 관련 청크를 밀어냄 — 4개 질의 실측 표 포함), 결정적 id 업서트, k=6(k=4에서 상품 비교형 질의의 정답 섹션이 6~7위로 밀림 — RAGAS Q9 실측).
 - `0003-multi-agent-supervisor.md`: 결정 `langgraph-supervisor` 패턴 + 4 워커. 근거: 역할 분리로 프롬프트 단순화·개별 테스트·트레이스 가독성, 핸드오프 도구 자동 생성. **위험 판단은 LLM이 아닌 순수 함수**로 두어 재현성·테스트 가능성 확보. `output_mode=full_history` 선택 이유(리포트 에이전트가 수치 원본을 봐야 함). **두 결정적 후처리 노드**: ① supervisor가 report_agent를 건너뛰고 직접 답하는 현상(2회 중 1회) → 위험 도구 실행 후 리포트가 없으면 그래프가 report_agent를 실행(ensure_report), ② supervisor가 리포트를 재작성해 헤더·면책 문구를 유실하는 현상(3회 중 1회)과 forward_message 도구 미호출을 실측 → 원문 교체(preserve_worker_answer). 대안: 프롬프트 강화·forward 도구 — 둘 다 확률적이라 배제. 외부 그래프 합성(컴파일된 supervisor를 서브그래프 노드로, 체크포인터는 외부 그래프에만; 내부 `remaining_steps`는 MessagesState에 노출되지 않음 확인). 의존성 리스크: langgraph-supervisor 0.0.31이 내부에서 deprecated `create_react_agent` 사용 → 외부 그래프 설계로 교체 가능성 확보. 대안: 단일 ReAct 에이전트(도구 많아지면 라우팅 품질 저하), Swarm(피어 핸드오프, 흐름 예측 어려움). 트레이드오프: 호출 수 증가로 지연·비용 상승.
 - `0004-jeonse-risk-rules.md`: Task 3의 기준표(전세가율 70/80/90, 부담률 80/90/100 — 전세가율 경계를 한 단계 보수적으로 올린 값, 낙찰가율 0.8 가정, 소액임차인 표, 주거비 30%)와 출처 URL, 경매 배당 순서 가정(최우선변제 → 선순위 → 내 보증금, 최우선변제는 낙찰가의 1/2 한도), 경계값 포함 규칙(70.0은 안전, 90.0은 HUG 가입 가능), 한계(낙찰가율 지역 편차, 신탁·가압류·당해세 미반영, 다가구 선순위 보증금은 사용자 입력 의존).
 - `0005-ragas-langchain-community-pin.md`: ragas 0.4.3이 `langchain_community.chat_models.vertexai`를 하드 import → community 0.4.x에서 제거됨. 0.3.31 고정으로 해결(langchain 1.3.18과 호환 확인 2026-09-02). 대안: ragas 미사용·자체 LLM-judge 구현(재현성↑, 공인 지표 신뢰↓), 평가 전용 별도 venv(운영 복잡). 결과: langchain-community를 직접 사용하지 않으므로 런타임 영향 없음. ragas 상위 수정 시 핀 해제.
