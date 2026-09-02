@@ -4,7 +4,15 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .env
+.env.*
+!.env.example
 data/chroma/
 eval/results/*.json
 .streamlit/secrets.toml
 dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
+.mypy_cache/
+.DS_Store
