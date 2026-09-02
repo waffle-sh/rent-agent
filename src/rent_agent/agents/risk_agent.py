@@ -57,7 +57,10 @@ def assess_jeonse_risk(
     반환: 전세가율, 총 부담률, 경매 시 회수액/부족액, 소액임차인 여부, 필요 대출·월 이자,
     판정(안전/주의/위험/매우 위험), 근거 문장 목록 (JSON).
     """
-    if max(deposit, market_price) > MAX_REASONABLE_MANWON:
+    if (
+        max(deposit, market_price, senior_liens, senior_deposits, own_capital)
+        > MAX_REASONABLE_MANWON
+    ):
         return (
             f"입력 오류: 금액이 비정상적으로 큽니다 (deposit={deposit:,}, "
             f"market_price={market_price:,}). "
