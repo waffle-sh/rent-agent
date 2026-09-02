@@ -2961,14 +2961,20 @@ def build_report_agent(settings: Settings):
 
 - output_mode='full_history': report_agent가 다른 에이전트의 도구 결과(수치)를 직접 봐야 하고,
   UI에서 에이전트 호출 흐름을 그대로 보여 주기 위함.
-- preserve_worker_answer 노드: 통합 테스트에서 supervisor가 report_agent의 리포트를 자기 말로 바꿔 쓰며
-  "## 종합 판정" 헤더·면책 문구를 유실하는 것이 관측됨(2026-09-02, 3회 중 1회). 프롬프트 지시와
-  langgraph-supervisor의 forward_message 도구 모두 모델이 따르지 않을 수 있어(도구 미호출 관측),
-  LLM 판단에 맡기지 않고 **결정적 후처리**로 보장한다: 마지막 사용자 메시지 이후 report_agent /
-  knowledge_agent의 최종 답이 있으면 supervisor의 마지막 메시지를 그 원문으로 교체한다.
+- 두 개의 결정적 후처리 (2026-09-02 통합 테스트 실측에 근거):
+  1) ensure_report: supervisor가 risk_agent 결과를 받은 뒤 report_agent를 건너뛰고 직접 답한 경우가
+     관측됨(2회 중 1회). 이번 턴에 assess_jeonse_risk가 실행됐는데 report_agent의 답이 없으면
+     그래프가 report_agent를 직접 실행한다.
+  2) preserve_worker_answer: supervisor가 report/knowledge 에이전트의 답을 재작성해 "## 종합 판정"
+     헤더·면책 문구를 유실한 경우가 관측됨(3회 중 1회). forward_message 도구도 모델이 호출하지 않았다.
+     마지막 사용자 턴 이후 워커의 최종 답이 있으면 supervisor의 마지막 메시지를 원문으로 교체한다.
+  프롬프트 지시는 확률적이므로, 결과의 완결성·충실성은 LLM 판단에 맡기지 않고 그래프가 보장한다.
 """
 
-from langchain_core.messages import AIMessage, HumanMessage
+from collections.abc import Callable
+from typing import Literal
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph_supervisor import create_supervisor
@@ -2982,30 +2988,57 @@ from rent_agent.agents.risk_agent import build_risk_agent
 from rent_agent.config import Settings
 
 SUPERVISOR_NAME = "supervisor"
+REPORT_AGENT = "report_agent"
+RISK_TOOL = "assess_jeonse_risk"
 # 이 에이전트들의 답은 사용자에게 원문 그대로 가야 한다 (수치·근거 URL·면책 문구 보존)
-VERBATIM_AGENTS = ("report_agent", "knowledge_agent")
+VERBATIM_AGENTS = (REPORT_AGENT, "knowledge_agent")
+
+
+def _current_turn(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """마지막 HumanMessage 이후 구간 (멀티턴에서 이전 턴의 결과를 끌어오지 않도록)."""
+    last_human = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
+    return messages[last_human + 1 :]
+
+
+def _last_worker_answer(turn: list[BaseMessage], names: tuple[str, ...]) -> AIMessage | None:
+    """도구 호출이 달린 AIMessage(핸드오프)는 워커의 '답'이 아니므로 제외."""
+    return next(
+        (m for m in reversed(turn) if isinstance(m, AIMessage) and m.name in names and not m.tool_calls and m.content),
+        None,
+    )
+
+
+def needs_report(state: MessagesState) -> Literal["report", "preserve"]:
+    """이번 턴에 위험 판단 도구가 실행됐는데 report_agent의 답이 없으면 리포트 단계로 보낸다."""
+    turn = _current_turn(state["messages"])
+    ran_risk = any(isinstance(m, ToolMessage) and m.name == RISK_TOOL for m in turn)
+    has_report = _last_worker_answer(turn, (REPORT_AGENT,)) is not None
+    return "report" if ran_risk and not has_report else "preserve"
+
+
+def make_report_node(report_agent) -> Callable[[MessagesState], dict]:
+    """report_agent를 단독 실행하고 결과 AIMessage에 이름을 붙인다 (supervisor 밖에서는 이름이 붙지 않음)."""
+
+    def run_report(state: MessagesState) -> dict:
+        before = len(state["messages"])
+        result = report_agent.invoke({"messages": state["messages"]})
+        new_messages = []
+        for m in result["messages"][before:]:
+            if isinstance(m, AIMessage):
+                m = m.model_copy(update={"name": REPORT_AGENT})
+            new_messages.append(m)
+        return {"messages": new_messages}
+
+    return run_report
 
 
 def preserve_worker_answer(state: MessagesState) -> dict:
     """supervisor의 마지막 답이 워커(report/knowledge)의 최종 답을 재작성한 것이면 원문으로 교체한다.
-
-    - 마지막 HumanMessage 이후 구간만 본다 (멀티턴 대화에서 이전 턴의 리포트를 끌어오지 않도록).
-    - 도구 호출이 달린 AIMessage(핸드오프)는 워커의 '답'이 아니므로 제외한다.
-    - 워커 답이 없거나(예: supervisor가 되묻는 경우) 이미 동일하면 아무것도 바꾸지 않는다.
-    """
+    워커 답이 없거나(예: supervisor가 되묻는 경우) 이미 동일하면 아무것도 바꾸지 않는다."""
     messages = state["messages"]
     if not messages:
         return {}
-    last_human = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
-    tail = messages[last_human + 1 :]
-    worker = next(
-        (
-            m
-            for m in reversed(tail)
-            if isinstance(m, AIMessage) and m.name in VERBATIM_AGENTS and not m.tool_calls and m.content
-        ),
-        None,
-    )
+    worker = _last_worker_answer(_current_turn(messages), VERBATIM_AGENTS)
     final = messages[-1]
     if worker is None or not isinstance(final, AIMessage) or final.name != SUPERVISOR_NAME:
         return {}
@@ -3025,11 +3058,12 @@ def preserve_worker_answer(state: MessagesState) -> dict:
 
 
 def build_graph(settings: Settings, checkpointer: BaseCheckpointSaver | None = None):
+    report_agent = build_report_agent(settings)
     agents = [
         build_knowledge_agent(settings),
         build_market_agent(settings),
         build_risk_agent(settings),
-        build_report_agent(settings),
+        report_agent,
     ]
     team = create_supervisor(
         agents,
@@ -3042,9 +3076,11 @@ def build_graph(settings: Settings, checkpointer: BaseCheckpointSaver | None = N
 
     outer = StateGraph(MessagesState)
     outer.add_node("team", team)
+    outer.add_node("report", make_report_node(report_agent))
     outer.add_node("preserve_worker_answer", preserve_worker_answer)
     outer.add_edge(START, "team")
-    outer.add_edge("team", "preserve_worker_answer")
+    outer.add_conditional_edges("team", needs_report, {"report": "report", "preserve": "preserve_worker_answer"})
+    outer.add_edge("report", "preserve_worker_answer")
     outer.add_edge("preserve_worker_answer", END)
     return outer.compile(checkpointer=checkpointer)
 ```
@@ -3053,7 +3089,7 @@ def build_graph(settings: Settings, checkpointer: BaseCheckpointSaver | None = N
 ```python
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from rent_agent.agents.supervisor import preserve_worker_answer
+from rent_agent.agents.supervisor import needs_report, preserve_worker_answer
 
 REPORT = "## 종합 판정: 위험\n...\n본 리포트는 참고 정보이며 법률·금융 자문이 아닙니다."
 
@@ -3092,6 +3128,38 @@ def test_uses_only_messages_after_last_human_turn():
     assert preserve_worker_answer({"messages": msgs}) == {}
 
 
+def _risk_only_flow() -> list:
+    return [
+        HumanMessage("보증금 4.5억 시세 6억 진단해줘", id="h1"),
+        AIMessage("", name="supervisor", id="s1", tool_calls=[{"name": "transfer_to_risk_agent", "args": {}, "id": "c1"}]),
+        ToolMessage("transferred", tool_call_id="c1", name="transfer_to_risk_agent", id="t1"),
+        AIMessage("", name="risk_agent", id="r1", tool_calls=[{"name": "assess_jeonse_risk", "args": {}, "id": "c2"}]),
+        ToolMessage('{"level": "위험"}', tool_call_id="c2", name="assess_jeonse_risk", id="t2"),
+        AIMessage("전세가율 75%로 위험입니다.", name="risk_agent", id="r2"),
+        AIMessage("", name="risk_agent", id="r3", tool_calls=[{"name": "transfer_back_to_supervisor", "args": {}, "id": "c3"}]),
+        ToolMessage("back", tool_call_id="c3", name="transfer_back_to_supervisor", id="t3"),
+        AIMessage("위험합니다. 조심하세요.", name="supervisor", id="s2"),
+    ]
+
+
+def test_needs_report_when_risk_tool_ran_without_report():
+    assert needs_report({"messages": _risk_only_flow()}) == "report"
+
+
+def test_no_report_needed_when_report_exists():
+    assert needs_report({"messages": _flow("요약")}) == "preserve"
+
+
+def test_no_report_needed_for_knowledge_only_turn():
+    msgs = [HumanMessage("대항력?", id="h1"), AIMessage("다음 날 0시.", name="knowledge_agent", id="k1"), AIMessage("다음 날 0시.", name="supervisor", id="s1")]
+    assert needs_report({"messages": msgs}) == "preserve"
+
+
+def test_needs_report_ignores_previous_turns():
+    msgs = _risk_only_flow() + [HumanMessage("고마워", id="h2"), AIMessage("네.", name="supervisor", id="s3")]
+    assert needs_report({"messages": msgs}) == "preserve"
+
+
 def test_knowledge_answer_is_also_preserved():
     msgs = [
         HumanMessage("대항력은 언제 생기나요", id="h1"),
@@ -3103,7 +3171,7 @@ def test_knowledge_answer_is_also_preserved():
 ```
 
 Run: `uv run pytest tests/agents/test_supervisor_finalize.py -v`
-Expected: 5 passed
+Expected: 9 passed
 
 - [ ] **Step 4: 통합 테스트 (실제 OpenAI 호출, CI 제외)**
 
@@ -3455,7 +3523,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 - `0001-llm-openai.md`: 결정 OpenAI gpt-4.1-mini + text-embedding-3-small. 근거: langchain 생태계 1급 지원, tool calling 안정성, 한국어 품질, 비용(mini). 대안: Claude(문서 이해 강점, 비용 상승), Ollama(무료지만 한국어·속도·tool calling 신뢰도). 결과: 모델명은 `OPENAI_MODEL` 환경변수로 교체 가능하게 격리.
 - `0002-vector-store-chroma.md`: 결정 Chroma 로컬 persist. 근거: 수십~수백 청크 규모, 메타데이터 필터 지원, 서버 불필요. 대안: FAISS(메타데이터 약함), pgvector(운영형이지만 Docker 부담). 결과: 확장 시 `rag/retriever.py`만 교체. **검색 전략 결정도 함께 기록**: 헤더 우선 분할(서문+첫 조문 병합으로 대항력 질의 1위 상실 실측), `## 출처` 제외, MMR 대신 단순 유사도(비중복 코퍼스에서 MMR이 관련 청크를 밀어냄 — 4개 질의 실측 표 포함), 결정적 id 업서트.
-- `0003-multi-agent-supervisor.md`: 결정 `langgraph-supervisor` 패턴 + 4 워커. 근거: 역할 분리로 프롬프트 단순화·개별 테스트·트레이스 가독성, 핸드오프 도구 자동 생성. **위험 판단은 LLM이 아닌 순수 함수**로 두어 재현성·테스트 가능성 확보. `output_mode=full_history` 선택 이유(리포트 에이전트가 수치 원본을 봐야 함). **원문 보존 후처리 노드**: supervisor가 리포트를 재작성해 헤더·면책 문구를 유실하는 현상(3회 중 1회)과 forward_message 도구 미호출을 실측 → LLM 판단 대신 결정적 노드로 보장(대안: 프롬프트 강화·forward 도구 — 둘 다 확률적). 대안: 단일 ReAct 에이전트(도구 많아지면 라우팅 품질 저하), Swarm(피어 핸드오프, 흐름 예측 어려움). 트레이드오프: 호출 수 증가로 지연·비용 상승.
+- `0003-multi-agent-supervisor.md`: 결정 `langgraph-supervisor` 패턴 + 4 워커. 근거: 역할 분리로 프롬프트 단순화·개별 테스트·트레이스 가독성, 핸드오프 도구 자동 생성. **위험 판단은 LLM이 아닌 순수 함수**로 두어 재현성·테스트 가능성 확보. `output_mode=full_history` 선택 이유(리포트 에이전트가 수치 원본을 봐야 함). **두 결정적 후처리 노드**: ① supervisor가 report_agent를 건너뛰고 직접 답하는 현상(2회 중 1회) → 위험 도구 실행 후 리포트가 없으면 그래프가 report_agent를 실행(ensure_report), ② supervisor가 리포트를 재작성해 헤더·면책 문구를 유실하는 현상(3회 중 1회)과 forward_message 도구 미호출을 실측 → 원문 교체(preserve_worker_answer). 대안: 프롬프트 강화·forward 도구 — 둘 다 확률적이라 배제. 대안: 단일 ReAct 에이전트(도구 많아지면 라우팅 품질 저하), Swarm(피어 핸드오프, 흐름 예측 어려움). 트레이드오프: 호출 수 증가로 지연·비용 상승.
 - `0004-jeonse-risk-rules.md`: Task 3의 기준표(전세가율 70/80/90, 부담률 80/90/100 — 전세가율 경계를 한 단계 보수적으로 올린 값, 낙찰가율 0.8 가정, 소액임차인 표, 주거비 30%)와 출처 URL, 경매 배당 순서 가정(최우선변제 → 선순위 → 내 보증금, 최우선변제는 낙찰가의 1/2 한도), 경계값 포함 규칙(70.0은 안전, 90.0은 HUG 가입 가능), 한계(낙찰가율 지역 편차, 신탁·가압류·당해세 미반영, 다가구 선순위 보증금은 사용자 입력 의존).
 - `0005-ragas-langchain-community-pin.md`: ragas 0.4.3이 `langchain_community.chat_models.vertexai`를 하드 import → community 0.4.x에서 제거됨. 0.3.31 고정으로 해결(langchain 1.3.18과 호환 확인 2026-09-02). 대안: ragas 미사용·자체 LLM-judge 구현(재현성↑, 공인 지표 신뢰↓), 평가 전용 별도 venv(운영 복잡). 결과: langchain-community를 직접 사용하지 않으므로 런타임 영향 없음. ragas 상위 수정 시 핀 해제.
 - `0006-uv-python312-streamlit.md`: uv(lock 재현성·속도), Python 3.12(라이브러리 호환 최광범위, 3.13은 일부 C 확장 미지원), Streamlit(파이썬 단일 스택으로 데모 속도, 대안 FastAPI+React는 포트폴리오 범위 대비 과함).
