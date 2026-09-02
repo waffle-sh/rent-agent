@@ -2324,7 +2324,9 @@ SUPERVISOR_PROMPT = """당신은 사회초년생·무주택자를 돕는 부동�
 KNOWLEDGE_PROMPT = """당신은 부동산 임대차 법령·제도 전문 상담사입니다.
 반드시 search_real_estate_knowledge 도구로 근거 문서를 먼저 검색한 뒤, 검색된 내용에 기반해서만 답합니다.
 - 답변 끝에 '근거:' 항목으로 사용한 문서 제목과 출처 URL을 나열합니다.
-- 검색 결과에 없는 내용은 "제공된 자료에서 확인되지 않음"이라고 명시하고 추측하지 않습니다.
+- 검색 결과에 없는 내용은 "제공된 자료에서 확인되지 않음"이라고만 답하고 추측하지 않습니다.
+  다른 주제의 수치(예: 증액 상한을 물었는데 보증 한도 금액)를 대체 답처럼 덧붙이지 않습니다 — 사용자가 혼동합니다.
+- 검색 결과에 있는 내용만 말합니다. 문서에 없는 일반 상식·실무 조언을 덧붙여 근거 없는 문장을 만들지 않습니다.
 - 법령·금액 기준은 문서의 기준일(effective_date)을 함께 안내합니다.
 - 사회초년생이 이해할 수 있게 용어를 풀어 설명하고, 실무적으로 무엇을 해야 하는지 한 줄로 정리합니다.
 한국어로 답합니다."""
@@ -3728,7 +3730,8 @@ async def main() -> None:
     agent = build_knowledge_agent(settings, retriever)
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
-    judge = llm_factory(settings.openai_model, client=client)
+    # 기본 max_tokens=1024는 한국어 법령 청크의 NLI 판정 JSON이 잘려 IncompleteOutputException (실측)
+    judge = llm_factory(settings.openai_model, client=client, max_tokens=4096)
     emb = RagasOpenAIEmbeddings(client=client, model=settings.openai_embedding_model)
     faith, relev, prec = Faithfulness(llm=judge), AnswerRelevancy(llm=judge, embeddings=emb), ContextPrecision(llm=judge)
 
@@ -3762,7 +3765,17 @@ if __name__ == "__main__":
 - [ ] **Step 3: 실행**
 
 Run: `uv run python scripts/eval_rag.py`
-Expected: 10줄 진행 출력 후 `요약: {'faithfulness': 0.x, ...}`. `eval/results/2026-09-xx.md` 생성. faithfulness가 0.8 미만이면 프롬프트/청킹 조정 대상으로 README에 기록.
+Expected: 10줄 진행 출력 후 `요약: {'faithfulness': 0.x, ...}`. `eval/results/2026-09-xx.md` 생성 (약 13분, 수십 센트). faithfulness가 0.8 미만이면 프롬프트/청킹 조정 대상으로 README에 기록.
+
+**지표 해석 (2026-09-02 1차 결과 F 0.881 / R 0.382 / P 0.900):** `answer_relevancy`는 LLM이 답에서 역생성한 질문 3개와 원 질문의 임베딩 코사인 평균이며, 답이 "확인되지 않음"류(noncommittal)면 0으로 처리한다. 한국어 + text-embedding-3-small에서는 정답이어도 0.2~0.7에 머물고, 정직한 "자료에 없음" 답이 0점이 된다. → 영어 벤치마크 임계값(0.8)과 비교하지 말고 **실행 간 기준선**으로만 쓴다. 신뢰할 지표는 faithfulness(환각)와 context_precision(검색).
+
+- [ ] **Step 3b: 1차 결과의 실패 사례 반영 후 재평가**
+
+1차 평가에서 Q4 "전세 보증금 증액 상한은 얼마인가요?"가 P=0.25, F=0.64: 5% 조문 청크(01 문서 "차임·보증금 증액 상한 5%")가 검색되지 않고 HUG "보증금 한도" 청크가 잡혔다(질의의 "보증금·상한" 어휘가 HUG 한도 섹션에 더 가깝고, 조문 헤더는 "차임"으로 시작). 에이전트는 "확인되지 않음"이라 답했지만 HUG 한도 7억/5억을 대체 답처럼 덧붙여 혼동을 만들었다.
+1. `data/raw/01-jutaek-imdaecha-boho-beop.md`의 해당 섹션 첫 문장에 질의 어휘를 보강한다: "전세 보증금 인상(증액) 한도, 흔히 '전월세 5% 상한'이라 부르는 규정이다." (사실 변경 없음, 검색 어휘만 추가)
+2. KNOWLEDGE_PROMPT(Task 9 블록)에 "다른 주제의 수치를 대체 답으로 덧붙이지 않음", "문서에 없는 일반 조언 금지" 지시 추가 → `prompts.py` 동기화.
+3. `uv run python scripts/ingest.py` 재적재 후 `uv run python scripts/eval_rag.py` 재실행. 결과 md는 같은 날짜 파일을 덮어쓴다.
+Expected: Q4의 context_precision > 0.25, 5% 조문이 컨텍스트에 포함; faithfulness 평균 유지 또는 상승.
 
 - [ ] **Step 4: 커밋 (md 결과 포함, json은 gitignore)**
 
