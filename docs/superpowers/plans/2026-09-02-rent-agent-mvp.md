@@ -1290,6 +1290,8 @@ def test_client_sends_decoded_key_once_and_uses_operation_per_type():
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(str(request.url))
+        if request.url.params["pageNo"] != "1":  # 픽스처 totalCount는 실제값(1,265)이라 2페이지째는 비운다
+            return httpx.Response(200, text=_response("", 1265))
         body = "rent_response_rh.xml" if "RHRent" in str(request.url) else "rent_response.xml"
         return httpx.Response(200, text=_xml(body))
 
@@ -1300,8 +1302,9 @@ def test_client_sends_decoded_key_once_and_uses_operation_per_type():
 
     assert len(apt) == 4 and apt[0].housing_type == HousingType.APARTMENT
     assert len(rh) == 4 and rh[0].housing_type == HousingType.MULTI_HOUSE
+    # 호출 순서: apt p1, apt p2(빈 페이지), rh p1, rh p2(빈 페이지)
     assert captured[0].startswith("https://apis.data.go.kr/1613000/RTMSDataSvcAptRent/getRTMSDataSvcAptRent?")
-    assert captured[1].startswith("https://apis.data.go.kr/1613000/RTMSDataSvcRHRent/getRTMSDataSvcRHRent?")
+    assert captured[2].startswith("https://apis.data.go.kr/1613000/RTMSDataSvcRHRent/getRTMSDataSvcRHRent?")
     # httpx가 한 번만 인코딩: '+' → %2B, '=' → %3D
     assert "serviceKey=abc%2Bdef%3D%3D" in captured[0]
     assert "LAWD_CD=11680" in captured[0] and "DEAL_YMD=202607" in captured[0]
@@ -1550,7 +1553,7 @@ class MockMolitRentClient:
 - [ ] **Step 5: 통과 확인**
 
 Run: `uv run pytest tests/tools/test_molit_rent.py -v`
-Expected: 20 passed (parametrize 3건 포함)
+Expected: 19 passed (17개 함수, parametrize 3건 포함)
 
 - [ ] **Step 6: 실제 API 스모크 (수동, 세 유형 각 1회)**
 
