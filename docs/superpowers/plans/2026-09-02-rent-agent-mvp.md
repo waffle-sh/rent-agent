@@ -2315,8 +2315,9 @@ SUPERVISOR_PROMPT = """당신은 사회초년생·무주택자를 돕는 부동�
    지역/단지 정보가 있으면 market_agent 도 호출해 시세 비교를 얻습니다.
    판단에 필요한 제도(소액임차인, 보증보험 등) 설명이 필요하면 knowledge_agent 도 호출합니다.
    마지막에 report_agent 를 호출해 종합 리포트를 만들게 하고, 그 리포트를 최종 답변으로 사용합니다.
-3. 사용자가 필수 정보(보증금, 매매 시세)를 주지 않았으면 에이전트를 호출하지 말고 무엇이 필요한지 물어봅니다.
-4. 같은 에이전트를 같은 입력으로 두 번 호출하지 않습니다.
+3. 지역·건물의 전세 시세만 묻는 요청(보증금·매매 시세 없음) → market_agent 만 호출하고 결과를 전달합니다.
+4. 진단 요청인데 필수 정보(보증금, 매매 시세)가 없으면 에이전트를 호출하지 말고 무엇이 필요한지 물어봅니다.
+5. 같은 에이전트를 같은 입력으로 두 번 호출하지 않습니다.
 항상 한국어로 답합니다."""
 
 KNOWLEDGE_PROMPT = """당신은 부동산 임대차 법령·제도 전문 상담사입니다.
@@ -2331,15 +2332,16 @@ MARKET_PROMPT = """당신은 전세 실거래가 조회 담당자입니다. 국�
 1. 사용자가 말한 지역명으로 find_region_code 를 호출해 시군구 코드를 찾습니다. 후보가 여럿이면 가장 구체적으로 일치하는 것을 고르고, 판단이 어려우면 후보를 나열해 되묻습니다.
 2. 주거 유형을 정합니다: 아파트 → apartment, 빌라·연립·다세대 → multi_house, 오피스텔 → officetel. 언급이 없으면 apartment로 조회하고 그 가정을 명시합니다.
 3. get_recent_jeonse_deals 를 호출해 최근 거래를 요약합니다.
-4. 시세 기준값은 **신규 계약 중위값(new_contract_median)** 을 우선 사용합니다. 갱신 계약은 증액 상한 5% 때문에 2년 전 가격이라 시세가 아닙니다.
-   new_contract_count가 3건 미만이면 전체 중위값(median_deposit)을 쓰되 "갱신 포함"이라고 명시합니다.
+4. 사용자의 보증금이 대화에 있으면 get_recent_jeonse_deals 에 deposit 으로 넘겨 ratio_to_reference 를 받습니다(직접 계산 금지).
+   기준값(reference_median)은 도구가 정합니다: 신규 계약 3건 이상이면 신규 중위값, 아니면 전체 중위값(갱신 포함). 갱신 계약은 증액 상한 5% 때문에 2년 전 가격이라 시세가 아닙니다.
 5. 결과는 주거 유형, 거래 건수(전체/신규), 기준 중위값과 그 근거, 최소/최대, 최근 거래 5건, 데이터 한계(건물명 표기 차이 가능, 신축·비등록 건물 누락 가능)를 포함해 간결히 보고합니다.
 숫자 단위는 '만원'입니다. 추측으로 시세를 만들지 않습니다. 한국어로 답합니다."""
 
 RISK_PROMPT = """당신은 전세 위험 판단 담당자입니다.
 사용자 정보에서 보증금, 매매 시세, 선순위 근저당 채권최고액, 선순위 보증금, 지역, 자기자금, 연소득, 금리를 추출해
 assess_jeonse_risk 도구를 **한 번** 호출합니다. 값이 없으면 도구의 기본값을 씁니다(금액 단위: 만원. '3억' → 30000).
-지역은 서울이면 seoul, 경기 과밀억제권역·세종·용인·화성·김포는 metro_over, 그 외 광역시는 metro_city, 나머지는 other.
+지역(region)은 대화에 market_agent의 find_region_code 결과가 있으면 그 small_tenant_region 값을 그대로 씁니다.
+없으면: 서울 → seoul, 경기 과밀억제권역·세종·용인·화성·김포 → metro_over, 그 외 광역시 → metro_city, 나머지 → other.
 도구 결과(수치·판정·근거)를 그대로 보고하고, 임의로 수치를 바꾸거나 새로 계산하지 않습니다. 한국어로 답합니다."""
 
 REPORT_PROMPT = """당신은 전세 계약 상담 리포트 작성자입니다. 대화에 있는 risk_agent, market_agent, knowledge_agent 의 결과만 사용해
@@ -2351,7 +2353,7 @@ REPORT_PROMPT = """당신은 전세 계약 상담 리포트 작성자입니다. 
 
 ## 핵심 수치
 - 전세가율, 총 부담률, 경매 시 회수 가능액/부족액, 소액임차인 해당 여부, 필요 대출·월 이자(있으면 소득 대비 %)
-- 시세 비교(market_agent 결과가 있으면): 동일 건물 최근 **신규 계약** 전세 중위값 대비 % (신규 3건 미만이면 전체 중위값, 갱신 포함 명시)
+- 시세 비교(market_agent 결과가 있으면): get_recent_jeonse_deals 결과의 reference_median·reference_basis·ratio_to_reference 값을 **그대로 인용**합니다 (직접 나누어 계산하지 않음). basis가 "전체(갱신 포함)"이면 그 사실을 명시.
 
 ## 이렇게 판단한 이유
 근거 문장들을 사회초년생 눈높이로 풀어서.
@@ -2504,9 +2506,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `src/rent_agent/agents/market_agent.py`
+- Modify: `src/rent_agent/agents/prompts.py` — Task 9 블록의 현재 텍스트와 일치시킨다 (SUPERVISOR 규칙 3 추가, RISK의 small_tenant_region 사용, MARKET 4번, REPORT 시세 비교 줄이 Task 9 리뷰 이후 갱신됨)
 - Test: `tests/agents/test_market_tool.py`
 
 도구는 클라이언트를 주입받아야 테스트 가능하므로 **팩토리 함수 안에서 `@tool`을 만든다**(클로저). 주거 유형은 문자열 인자로 받아 `HousingType`으로 검증한다.
+
+**결정적 계산 원칙 (Task 9 리뷰):** LLM이 수치를 계산하지 않도록, (1) 시세 대비 비율은 도구가 `deposit`을 받아 `ratio_to_reference`로 계산해 돌려주고, (2) 소액임차인 지역 구분은 `find_region_code`가 `small_tenant_region`으로 함께 반환한다. 현재 코드표의 경기 항목(수원·성남·고양·용인·부천·안양·화성·하남·광명·과천)은 모두 과밀억제권역 또는 시행령이 명시한 도시라 `metro_over`, 서울은 `seoul`.
 
 - [ ] **Step 1: 실패 테스트**
 
@@ -2524,10 +2529,12 @@ def test_recent_deal_months():
     assert recent_deal_months(today=date(2026, 1, 15), months=2) == ["202601", "202512"]
 
 
-def test_find_region_code_tool():
+def test_find_region_code_tool_includes_small_tenant_region():
     find_region_code, _ = make_market_tools(MockMolitRentClient())
     out = json.loads(find_region_code.invoke({"query": "강남구"}))
-    assert out == [{"name": "서울특별시 강남구", "code": "11680"}]
+    assert out == [{"name": "서울특별시 강남구", "code": "11680", "small_tenant_region": "seoul"}]
+    out = json.loads(find_region_code.invoke({"query": "분당"}))
+    assert out[0]["small_tenant_region"] == "metro_over"
 
 
 def test_get_recent_jeonse_deals_apartment_default():
@@ -2551,6 +2558,22 @@ def test_get_recent_jeonse_deals_multi_house():
     assert out["median_deposit"] == 51250
     assert out["new_contract_count"] == 2 and out["new_contract_median"] == 51250
     assert out["recent"][0]["sub_type"] in ("연립", "다세대")
+
+
+def test_reference_and_ratio_computed_by_tool():
+    _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
+    # 아파트 까치마을 39.6: 신규 0건 → 기준은 전체 중위값 45,000 (갱신 포함). 보증금 54,000 → 120.0%
+    out = json.loads(
+        get_recent_jeonse_deals.invoke(
+            {"lawd_cd": "11680", "building_name": "까치마을", "area_m2": 39.6, "months": 1, "deposit": 54000}
+        )
+    )
+    assert out["reference_median"] == 45000
+    assert out["reference_basis"] == "전체(갱신 포함, 신규 3건 미만)"
+    assert out["ratio_to_reference"] == 120.0
+    # 보증금 미제공 → 비율 없음
+    out2 = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "building_name": "까치마을", "months": 1}))
+    assert out2["ratio_to_reference"] is None and out2["reference_median"] is not None
 
 
 def test_get_recent_jeonse_deals_officetel_no_jeonse():
@@ -2597,6 +2620,15 @@ from rent_agent.tools.molit_rent import (
 )
 
 
+MIN_NEW_CONTRACTS = 3  # 신규 계약이 이 건수 이상이면 신규 중위값을 시세 기준으로 쓴다
+
+
+def small_tenant_region(region_name: str) -> str:
+    """법정동 정식 명칭 → 소액임차인 최우선변제 지역 구분. 현재 코드표(서울 25구 + 경기 25개 시·구)에만 유효:
+    경기 항목은 모두 과밀억제권역(수원·성남·고양·부천·안양·하남·광명·과천) 또는 시행령이 직접 명시한 도시(용인·화성)다."""
+    return "seoul" if region_name.startswith("서울") else "metro_over"
+
+
 def recent_deal_months(today: date | None = None, months: int = 3) -> list[str]:
     """오늘부터 과거 months개월의 YYYYMM 목록 (최신 먼저)."""
     today = today or date.today()
@@ -2613,10 +2645,15 @@ def recent_deal_months(today: date | None = None, months: int = 3) -> list[str]:
 def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
     @tool
     def find_region_code(query: str) -> str:
-        """지역명(예: '강남구', '분당구', '서울')으로 실거래가 조회에 필요한 시군구 법정동코드(5자리)를 찾는다.
-        부분 일치 목록을 JSON [{name, code}]로 반환. 동(洞) 이름은 지원하지 않으니 구/시 단위로 질의한다."""
+        """지역명(예: '강남구', '분당구', '서울 강남구')으로 실거래가 조회에 필요한 시군구 법정동코드(5자리)를 찾는다.
+        부분 일치 목록을 JSON [{name, code, small_tenant_region}]로 반환. small_tenant_region은 소액임차인
+        최우선변제 지역 구분(seoul | metro_over)으로, risk 판단 시 region 인자로 그대로 쓴다. 동(洞) 이름은 지원하지 않는다."""
         return json.dumps(
-            [{"name": n, "code": c} for n, c in find_lawd_codes(query)], ensure_ascii=False
+            [
+                {"name": n, "code": c, "small_tenant_region": small_tenant_region(n)}
+                for n, c in find_lawd_codes(query)
+            ],
+            ensure_ascii=False,
         )
 
     @tool
@@ -2626,13 +2663,15 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
         building_name: str | None = None,
         area_m2: float | None = None,
         months: int = 3,
+        deposit: int | None = None,
     ) -> str:
         """국토부 전월세 실거래가에서 최근 N개월 순수 전세(월세 0) 거래를 조회해 요약한다.
         lawd_cd: find_region_code로 얻은 5자리 코드.
         housing_type: apartment(아파트) | multi_house(연립·다세대·빌라) | officetel(오피스텔).
-        building_name: 건물/단지명 일부(선택). area_m2: 전용면적 ㎡(선택, ±5㎡).
-        반환 JSON: housing_type, count, median_deposit(전체 중위값), new_contract_count, new_contract_median(갱신 제외 중위값 —
-        시세 비교에 우선 사용, 3건 미만이면 median_deposit로 대체하되 갱신 포함임을 명시), min/max_deposit(만원), recent(최근 5건), months_queried."""
+        building_name: 건물/단지명 일부(선택). area_m2: 전용면적 ㎡(선택, ±5㎡). deposit: 사용자의 보증금(만원, 선택).
+        반환 JSON: housing_type, count, median_deposit(전체), new_contract_count, new_contract_median(갱신 제외),
+        reference_median·reference_basis(도구가 정한 시세 기준값: 신규 3건 이상이면 신규 중위값, 아니면 전체),
+        ratio_to_reference(deposit ÷ reference_median × 100, deposit이 있을 때만), min/max_deposit(만원), recent(최근 5건), months_queried."""
         try:
             htype = HousingType(housing_type)
         except ValueError:
@@ -2648,6 +2687,11 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
             except MolitApiError as e:
                 errors.append(f"{ymd}: {e}")
         summary = summarize_jeonse(records, building_name=building_name, area_m2=area_m2)
+        if summary.new_contract_count >= MIN_NEW_CONTRACTS:
+            reference, basis = summary.new_contract_median, "신규 계약 중위값"
+        else:
+            reference, basis = summary.median_deposit, "전체(갱신 포함, 신규 3건 미만)"
+        ratio = round(deposit / reference * 100, 1) if (deposit and reference) else None
         payload: dict = {
             "housing_type": htype.value,
             "count": summary.count,
@@ -2656,6 +2700,9 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
             "max_deposit": summary.max_deposit,
             "new_contract_count": summary.new_contract_count,
             "new_contract_median": summary.new_contract_median,
+            "reference_median": reference,
+            "reference_basis": basis if reference is not None else None,
+            "ratio_to_reference": ratio,
             "recent": [
                 {**asdict(r), "housing_type": r.housing_type.value, "deal_date": r.deal_date.isoformat()}
                 for r in summary.recent
@@ -2695,8 +2742,11 @@ Expected: 모두 passed
 - [ ] **Step 5: 커밋**
 
 ```bash
-git add src/rent_agent/agents/market_agent.py tests/agents/test_market_tool.py
+git add src/rent_agent/agents/market_agent.py src/rent_agent/agents/prompts.py tests/agents/test_market_tool.py
 git commit -m "feat: 실거래가 기반 시세 조회 에이전트 (아파트·연립다세대·오피스텔)
+
+- 시세 대비 비율·소액임차인 지역 구분을 도구가 결정적으로 계산해 LLM 산술 제거
+- 프롬프트: 시세만 묻는 요청 라우팅, 도구 값 그대로 인용
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
