@@ -1796,17 +1796,76 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 9: LLM 팩토리 + 프롬프트 모음
+### Task 9: LLM 팩토리 + 프롬프트 모음 + LangSmith 트레이싱 활성화
 
 **Files:**
 - Create: `src/rent_agent/agents/__init__.py`, `src/rent_agent/agents/llm.py`, `src/rent_agent/agents/prompts.py`
+- Modify: `src/rent_agent/config.py` (LangSmith 필드 보정)
+- Test: `tests/agents/__init__.py`, `tests/agents/test_llm.py`
 
-- [ ] **Step 1: 구현**
+**배경 (Task 2 리뷰 지적):** pydantic-settings는 `.env`를 `Settings` 객체로만 읽고 `os.environ`에 올리지 않는다. LangSmith 트레이서는 `os.environ`만 보므로, `.env`만 채운 사용자는 트레이스가 남지 않는다. → 진입점(Streamlit, 평가 스크립트, 통합 테스트)에서 `configure_tracing(settings)`를 호출해 환경변수로 올린다.
+
+- [ ] **Step 1: 실패 테스트**
+
+`tests/agents/__init__.py`: 빈 파일.
+
+`tests/agents/test_llm.py`:
+```python
+from rent_agent.agents.llm import configure_tracing, get_llm
+from rent_agent.config import Settings
+
+
+def test_get_llm_uses_settings(monkeypatch):
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-test")
+    llm = get_llm(Settings(), temperature=0.3)
+    assert llm.model_name == "gpt-test"
+    assert llm.temperature == 0.3
+
+
+def test_configure_tracing_exports_env_when_enabled(monkeypatch):
+    for k in ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT"):
+        monkeypatch.delenv(k, raising=False)
+    s = Settings(langsmith_tracing=True, langsmith_api_key="lsv2_test", langsmith_project="p")
+    configure_tracing(s)
+    import os
+
+    assert os.environ["LANGSMITH_TRACING"] == "true"
+    assert os.environ["LANGSMITH_API_KEY"] == "lsv2_test"
+    assert os.environ["LANGSMITH_PROJECT"] == "p"
+
+
+def test_configure_tracing_noop_when_disabled_or_no_key(monkeypatch):
+    import os
+
+    for k in ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT"):
+        monkeypatch.delenv(k, raising=False)
+    configure_tracing(Settings(langsmith_tracing=True, langsmith_api_key=None))
+    configure_tracing(Settings(langsmith_tracing=False, langsmith_api_key="lsv2_test"))
+    assert "LANGSMITH_API_KEY" not in os.environ
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `uv run pytest tests/agents/test_llm.py -v`
+Expected: FAIL — ModuleNotFoundError
+
+- [ ] **Step 3: 구현**
+
+`src/rent_agent/config.py` 수정 — LangSmith 블록을 아래로 교체:
+```python
+    # LangSmith. 주의: pydantic-settings는 .env를 os.environ에 올리지 않는다.
+    # 트레이서는 os.environ만 읽으므로 진입점에서 agents.llm.configure_tracing()을 호출해야 한다.
+    langsmith_tracing: bool = False
+    langsmith_api_key: str | None = None
+    langsmith_project: str = "rent-agent"
+```
 
 `src/rent_agent/agents/__init__.py`: 빈 파일.
 
 `src/rent_agent/agents/llm.py`:
 ```python
+import os
+
 from langchain_openai import ChatOpenAI
 
 from rent_agent.config import Settings
@@ -1815,6 +1874,16 @@ from rent_agent.config import Settings
 def get_llm(settings: Settings, temperature: float = 0.0) -> ChatOpenAI:
     # temperature 0: 라우팅·수치 설명은 재현성이 중요. 창의성 불필요.
     return ChatOpenAI(model=settings.openai_model, temperature=temperature, api_key=settings.openai_api_key)
+
+
+def configure_tracing(settings: Settings) -> None:
+    """LangSmith 트레이싱을 켠다. .env 값을 프로세스 환경변수로 올려 langchain 트레이서가 읽게 한다.
+    이미 환경변수가 있으면 덮어쓰지 않는다."""
+    if not (settings.langsmith_tracing and settings.langsmith_api_key):
+        return
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    os.environ.setdefault("LANGSMITH_API_KEY", settings.langsmith_api_key)
+    os.environ.setdefault("LANGSMITH_PROJECT", settings.langsmith_project)
 ```
 
 `src/rent_agent/agents/prompts.py`:
@@ -1884,14 +1953,14 @@ knowledge_agent가 준 근거가 있으면 나열.
 마지막에 "본 리포트는 입력값과 공개 자료에 기반한 참고 정보이며 법률·금융 자문이 아닙니다."를 붙입니다. 한국어로 씁니다."""
 ```
 
-- [ ] **Step 2: 린트 & 커밋**
+- [ ] **Step 4: 통과 확인 & 커밋**
 
-Run: `uv run ruff check src`
-Expected: 통과
+Run: `uv run pytest tests/agents/test_llm.py tests/test_config.py -v && uv run ruff check .`
+Expected: 모두 passed
 
 ```bash
-git add src/rent_agent/agents
-git commit -m "feat: LLM 팩토리 및 에이전트 시스템 프롬프트
+git add src/rent_agent/agents src/rent_agent/config.py tests/agents
+git commit -m "feat: LLM 팩토리, 에이전트 시스템 프롬프트, LangSmith 트레이싱 활성화 함수
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -2354,6 +2423,7 @@ import os
 import pytest
 from langchain_core.messages import HumanMessage
 
+from rent_agent.agents.llm import configure_tracing
 from rent_agent.agents.supervisor import build_graph
 from rent_agent.config import PROJECT_ROOT, Settings
 
@@ -2366,6 +2436,7 @@ def real_settings(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     # conftest는 .env를 차단하므로 통합 테스트만 실제 .env를 명시적으로 읽는다
     s = Settings(_env_file=PROJECT_ROOT / ".env")
+    configure_tracing(s)
     if not s.openai_api_key or s.openai_api_key.startswith("sk-test"):
         pytest.skip("OPENAI_API_KEY 필요")
     if not os.path.exists(s.chroma_dir):
@@ -2444,6 +2515,7 @@ import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from rent_agent.agents.llm import configure_tracing
 from rent_agent.agents.supervisor import build_graph
 from rent_agent.config import get_settings
 
@@ -2455,7 +2527,9 @@ HOUSING_LABELS = {"아파트": "apartment", "연립·다세대(빌라)": "multi_
 
 @st.cache_resource
 def _graph():
-    return build_graph(get_settings(), checkpointer=InMemorySaver())
+    settings = get_settings()
+    configure_tracing(settings)  # .env의 LangSmith 설정을 프로세스 환경으로
+    return build_graph(settings, checkpointer=InMemorySaver())
 
 
 def _run(prompt: str):
@@ -2603,6 +2677,7 @@ from ragas.llms import llm_factory
 from ragas.metrics.collections import AnswerRelevancy, ContextPrecision, Faithfulness
 
 from rent_agent.agents.knowledge_agent import build_knowledge_agent
+from rent_agent.agents.llm import configure_tracing
 from rent_agent.config import get_settings
 from rent_agent.rag.retriever import get_retriever
 
@@ -2611,6 +2686,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 async def main() -> None:
     settings = get_settings()
+    configure_tracing(settings)
     retriever = get_retriever(settings)
     agent = build_knowledge_agent(settings, retriever)
 
@@ -2709,7 +2785,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `.github/workflows/ci.yml`
 - Modify: `README.md` (평가 결과·ADR 링크·프로젝트 구조 섹션 추가)
 
-- [ ] **Step 1: CI 워크플로**
+- [ ] **Step 1: ruff가 마크다운 코드블록을 포맷 검사하지 않도록 `docs/` 제외 + CI 워크플로**
+
+ruff 0.16은 `.md` 안의 코드 펜스도 `ruff format --check` 대상으로 삼아 계획 문서의 긴 줄에서 실패한다(Task 2 리뷰에서 확인). `pyproject.toml`의 `[tool.ruff]`에 추가:
+```toml
+extend-exclude = ["docs", "data"]
+```
 
 `.github/workflows/ci.yml`:
 ```yaml
