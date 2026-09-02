@@ -71,9 +71,9 @@ RAGAS 0.4.3, gpt-4.1-mini 판정, `k=6`, `n=10` ([전문](eval/results/2026-09-0
 | answer_relevancy | 0.425 |
 | context_precision | 0.851 |
 
-1→6차 변화([`eval/results/history.md`](eval/results/history.md)): 헤더 우선 분할·`chunk_size` 1000·`k` 4→6·faithfulness 컨텍스트를 에이전트의 실제 `ToolMessage`로 교체하며 F 0.881 → 0.961로 올랐다(P는 k 변경 전후를 비교하지 않는다).
+1→6차 변화([`eval/results/history.md`](eval/results/history.md)): 헤더 우선 분할·`chunk_size` 1000·`k` 4→6을 거치며 1~5차는 **스크립트가 따로 돌린 검색 결과**를 컨텍스트로 판정했고(F 0.881→0.914), 6차부터는 **에이전트가 실제로 본 `ToolMessage`**를 컨텍스트로 쓴다(F 0.961). 산정 방식이 다르므로 1~5차와 6차의 F는 직접 비교할 수 없다. P도 k 변경 전후를 비교하지 않는다.
 
-**평가 한계**: n=10, 문서 작성자가 만든 질문(독립 평가셋 아님); 단일 실행, 판정 변동 ≈ ±0.05; 판정 모델 = 에이전트 모델(자기 선호 위험); P는 k·청크 크기 변경 전후 비교 불가; answer_relevancy는 한국어+small 임베딩에서 절대값 의미 약함; 질문 2건이 코퍼스 어휘 보강(사실 불변)을, 1건이 reference 수정을 유발함(테스트셋 튜닝 공개).
+**평가 한계**: n=10, 문서 작성자가 만든 질문(독립 평가셋 아님); 단일 실행, 판정 변동 ≈ ±0.05; 판정 모델 = 에이전트 모델(자기 선호 위험); P는 k·청크 크기 변경 전후 비교 불가; answer_relevancy는 한국어+small 임베딩에서 절대값 의미 약함; 질문 2건이 코퍼스 어휘 보강(사실 불변)을, 1건이 reference 수정을 유발함(테스트셋 튜닝 공개); faithfulness는 6차부터 에이전트가 실제 본 `ToolMessage`를 컨텍스트로 사용 — 1~5차와 직접 비교 불가.
 
 ## 에이전트 동작 예시
 
@@ -127,6 +127,8 @@ knowledge_agent가 `search_real_estate_knowledge`를 5회 병렬 호출한 것(�
 
 이어지는 절은 `## 이렇게 판단한 이유`, `## 계약 전 꼭 할 것`, `## 참고한 제도/문서`, 그리고 면책 문구다.
 
+재현: `uv run python scripts/demo_trace.py` (실제 OpenAI 호출, 수십 초). `--question`으로 다른 질문을 넣을 수 있다. 라우팅은 확률적이므로 호출 순서·횟수는 실행마다 달라질 수 있다.
+
 ## 프로젝트 구조
 
 ```
@@ -146,10 +148,18 @@ knowledge_agent가 `search_real_estate_knowledge`를 5회 병렬 호출한 것(�
 │   │   └── supervisor.py          # build_graph(): 팀 + 결정적 후처리 2개
 │   └── app/streamlit_app.py
 ├── tests/                         # 유닛 117 + 통합 52 (도메인·툴·RAG·에이전트·UI 스모크)
+│   ├── test_config.py             # Settings 로딩·기본값
+│   └── tools/test_lawd_code_live.py   # @integration: 실제 법정동코드 조회
 ├── data/raw/                      # RAG 원문 5건 (markdown + frontmatter: source·effective_date)
-├── eval/                          # dataset.jsonl + results/ (회차별 md, history.md)
-├── scripts/                       # ingest.py, eval_rag.py
-├── docs/adr/                      # 설계 결정 기록 6건
+├── eval/                          # dataset.jsonl + results/ (날짜별 md(같은 날 여러 회차는 덮어씀) + history.md)
+├── scripts/
+│   ├── ingest.py                  # data/raw → Chroma
+│   ├── eval_rag.py                # RAGAS 평가
+│   └── demo_trace.py              # 위 "에이전트 동작 예시" 재현
+├── docs/
+│   ├── adr/                       # 설계 결정 기록 6건
+│   └── *.hwp                      # 국토부 실거래가 API 기술문서 3건 (공공데이터포털 제공, 참고용)
+├── .streamlit/config.toml         # Streamlit 테마·서버 설정
 └── .github/workflows/ci.yml
 ```
 
