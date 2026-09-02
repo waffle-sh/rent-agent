@@ -2505,7 +2505,7 @@ def assess_jeonse_risk(
     own_capital: 자기자금. annual_income: 연소득(선택). loan_rate: 전세대출 예상 금리(%).
     반환: 전세가율, 총 부담률, 경매 시 회수액/부족액, 소액임차인 여부, 필요 대출·월 이자, 판정(안전/주의/위험/매우 위험), 근거 문장 목록 (JSON).
     """
-    if max(deposit, market_price) > MAX_REASONABLE_MANWON:
+    if max(deposit, market_price, senior_liens, senior_deposits, own_capital) > MAX_REASONABLE_MANWON:
         return (
             f"입력 오류: 금액이 비정상적으로 큽니다 (deposit={deposit:,}, market_price={market_price:,}). "
             "원이 아닌 만원 단위로 변환해 다시 호출하세요 (예: 3억 5천만원 → 35000)."
@@ -2806,6 +2806,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `src/rent_agent/agents/knowledge_agent.py`, `src/rent_agent/agents/report_agent.py`, `src/rent_agent/agents/supervisor.py`
+- Modify: `src/rent_agent/agents/risk_agent.py` — 만원 단위 가드의 `max(...)`에 `senior_liens, senior_deposits, own_capital`도 포함 (Task 10 리뷰 nit; Task 10 블록 코드가 이미 그 형태)
 - Test: `tests/agents/test_knowledge_tool.py`, `tests/agents/test_graph_integration.py`
 
 - [ ] **Step 1: 실패 테스트 (지식 검색 도구는 Fake 임베딩으로)**
