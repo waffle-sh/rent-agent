@@ -316,7 +316,11 @@ Expected: 푸시 성공. `gh repo view waffle-sh/rent-agent --json isEmpty` → 
 
 **Files:**
 - Create: `src/rent_agent/config.py`
+- Modify: `tests/conftest.py` (테스트 격리 보강 — Task 1 코드 리뷰 지적)
+- Modify: `.env.example`
 - Test: `tests/test_config.py`
+
+**테스트 격리 원칙:** 유닛 테스트는 실제 `.env`를 절대 읽지 않는다. `Settings`는 env 파일 경로를 `RENT_AGENT_ENV_FILE` 환경변수로 바꿔 끼울 수 있게 하고, conftest가 이를 존재하지 않는 경로로 고정한다. `get_settings()`의 `lru_cache`는 테스트마다 비운다.
 
 - [ ] **Step 1: 실패 테스트 작성**
 
@@ -345,6 +349,13 @@ def test_apartment_key_is_url_decoded(monkeypatch):
 
 def test_get_settings_is_cached():
     assert get_settings() is get_settings()
+
+
+def test_real_env_file_is_not_read_in_tests():
+    """conftest가 RENT_AGENT_ENV_FILE을 없는 경로로 고정하므로, .env에만 있는 값은 비어 있어야 한다."""
+    s = Settings()
+    assert s.langsmith_api_key is None
+    assert s.apartment_openapi_key == "test%2Bkey%3D%3D"  # conftest 더미
 ```
 
 - [ ] **Step 2: 실패 확인**
@@ -358,6 +369,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'rent_agent.config'`
 ```python
 """환경 변수 기반 설정. .env 파일은 pydantic-settings가 읽는다."""
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote
@@ -365,12 +377,12 @@ from urllib.parse import unquote
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 테스트가 실제 .env를 읽지 않도록 경로를 환경변수로 바꿔 끼울 수 있게 한다 (conftest 참고).
+ENV_FILE = os.getenv("RENT_AGENT_ENV_FILE", str(PROJECT_ROOT / ".env"))
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=PROJECT_ROOT / ".env", env_file_encoding="utf-8", extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
     # OpenAI
     openai_api_key: str
@@ -406,10 +418,37 @@ def get_settings() -> Settings:
     return Settings()
 ```
 
+`tests/conftest.py` 전체를 아래로 교체한다. 모듈 최상단에서 `RENT_AGENT_ENV_FILE`을 설정하는 이유: `rent_agent.config`가 import되는 시점(테스트 모듈 수집)에 이미 값이 있어야 하기 때문.
+
+```python
+import os
+from pathlib import Path
+
+import pytest
+
+# rent_agent.config가 import될 때 실제 .env 대신 존재하지 않는 파일을 보게 한다 (fixture보다 먼저 실행되어야 함).
+os.environ["RENT_AGENT_ENV_FILE"] = str(Path(__file__).parent / "does-not-exist.env")
+
+
+@pytest.fixture(autouse=True)
+def _dummy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """유닛 테스트는 실제 키 없이 돌아야 한다.
+    - 필수 키는 더미로 채운다.
+    - .env 파일은 위 RENT_AGENT_ENV_FILE 덕분에 읽히지 않는다.
+    - get_settings()의 lru_cache를 매 테스트 전에 비워 테스트 간 오염을 막는다."""
+    from rent_agent.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("APARTMENT_OPENAPI_KEY", "test%2Bkey%3D%3D")
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+    monkeypatch.setenv("MOLIT_USE_MOCK", "true")
+```
+
 - [ ] **Step 4: 통과 확인**
 
 Run: `uv run pytest tests/test_config.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 5: `.env.example`에 추가 엔드포인트 반영**
 
@@ -427,8 +466,11 @@ MOLIT_USE_MOCK=false
 - [ ] **Step 6: 커밋**
 
 ```bash
-git add src/rent_agent/config.py tests/test_config.py .env.example
+git add src/rent_agent/config.py tests/test_config.py tests/conftest.py .env.example
 git commit -m "feat: pydantic-settings 기반 Settings 및 공공데이터 키 디코딩
+
+- RENT_AGENT_ENV_FILE로 env 파일 경로 주입, 테스트는 실제 .env를 읽지 않음
+- get_settings lru_cache를 테스트마다 초기화
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -2313,7 +2355,7 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from rent_agent.agents.supervisor import build_graph
-from rent_agent.config import Settings
+from rent_agent.config import PROJECT_ROOT, Settings
 
 pytestmark = pytest.mark.integration
 
@@ -2322,7 +2364,8 @@ pytestmark = pytest.mark.integration
 def real_settings(monkeypatch):
     for k in ("OPENAI_API_KEY", "APARTMENT_OPENAPI_KEY", "MOLIT_USE_MOCK", "LANGSMITH_TRACING"):
         monkeypatch.delenv(k, raising=False)
-    s = Settings()  # .env 로드
+    # conftest는 .env를 차단하므로 통합 테스트만 실제 .env를 명시적으로 읽는다
+    s = Settings(_env_file=PROJECT_ROOT / ".env")
     if not s.openai_api_key or s.openai_api_key.startswith("sk-test"):
         pytest.skip("OPENAI_API_KEY 필요")
     if not os.path.exists(s.chroma_dir):
