@@ -1954,7 +1954,10 @@ def test_real_corpus_chunking_is_stable():
     chunks = split_documents(load_markdown_docs(REAL_RAW))
     assert 40 <= len(chunks) <= 70
     assert not any(c.metadata["section"].startswith("출처") for c in chunks)
-    assert all(len(c.page_content) <= 900 for c in chunks)
+    assert all(len(c.page_content) <= 1000 + 40 for c in chunks)  # 청크 + "[제목] " 접두
+    # 섹션 = 청크: 실제 문서의 어떤 ## 섹션도 둘로 갈리지 않아야 한다 (RAGAS Q9 회귀 방지)
+    keys = [(c.metadata["file"], c.metadata["section"]) for c in chunks]
+    assert len(keys) == len(set(keys)), [k for k in keys if keys.count(k) > 1]
 
 
 def test_build_vectorstore_persists_and_searches(tmp_path: Path):
@@ -2051,7 +2054,14 @@ EXCLUDED_SECTION_PREFIXES = ("출처",)
 FALLBACK_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
 
 
-def split_documents(docs: list[Document], chunk_size: int = 800, chunk_overlap: int = 100) -> list[Document]:
+# 섹션 = 청크 원칙: 가장 긴 섹션(≈950자)이 잘리지 않도록 1000. 800이면 734자+210자로 갈라진 꼬리(실무 팁)가
+# 본문보다 먼저 검색되어 정답 근거가 컨텍스트에서 빠지는 문제가 실측됨 (RAGAS Q9, 2026-09-02).
+DEFAULT_CHUNK_SIZE = 1000
+
+
+def split_documents(
+    docs: list[Document], chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: int = 100
+) -> list[Document]:
     header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=HEADERS, strip_headers=False)
     char_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=FALLBACK_SEPARATORS
@@ -3792,7 +3802,13 @@ KNOWLEDGE_PROMPT(Task 9 블록)에 "각 조건을 해당 상품에만 귀속" �
 2. `data/raw/05-youth-jeonse-loan.md` 섹션 헤더 `## ② 청년전용 버팀목 전세자금` → `## ② 청년전용 버팀목 전세자금 — 연령·소득·한도 요건` (질의 어휘 매칭; 사실 변경 없음). 비교표 헤더는 유지.
 3. `retriever_k` 기본값 4 → 6 (`config.py`, Task 2 블록 반영). 근거: 54청크 코퍼스에서 상품 비교형 질의는 관련 섹션이 4~6개.
 4. `uv run python scripts/ingest.py` 재적재 → `scripts/eval_rag.py` 4차 실행. Q9 컨텍스트에 섹션 ②가 포함되는지 확인.
-README에는 최종(4차) 수치와 1→4차 변화·해석을 기록한다. n=10이라 ±0.05는 판정 변동 범위임을 명시.
+**4차 결과: F 0.911 / R 0.436 / P 0.832(k=6이라 P는 k=4 값과 비교 불가).** Q9는 여전히 0.57 — 이제 원인이 정확함: 섹션 ②가 800자 기준으로 734자 본문(연령표·병역 예외) + 210자 꼬리(실무 팁)로 갈리고, 꼬리가 "만 34세 이하라면 청년전용" 문장 때문에 본문보다 먼저 검색됨(6위). 즉 답은 문서와 일치하지만 근거 청크가 컨텍스트에 없어 faithfulness가 정당하게 감점.
+
+- [ ] **Step 3e: 섹션 = 청크 보장 후 5차(최종) 평가**
+1. `rag/ingest.py`의 `split_documents` 기본 `chunk_size`를 800 → **1000**(`DEFAULT_CHUNK_SIZE`, Task 8 블록 반영). 가장 긴 섹션이 ≈950자라 모든 `##` 섹션이 한 청크가 된다.
+2. `tests/rag/test_ingest.py::test_real_corpus_chunking_is_stable`에 "(file, section) 중복 없음" 단언 추가(Task 8 블록 반영) — 섹션 분할 회귀 방지.
+3. 재적재 → 5차 평가. Q9 컨텍스트에 섹션 ② 본문(병역 예외 포함)이 들어오는지 확인.
+README에는 최종(5차) 수치와 1→5차 변화·해석을 기록한다. n=10이라 ±0.05는 판정 변동 범위임을 명시. P는 k 변경 전후를 비교하지 않는다.
 
 - [ ] **Step 4: 커밋 (md 결과 포함, json은 gitignore)**
 
