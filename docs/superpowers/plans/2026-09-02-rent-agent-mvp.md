@@ -486,7 +486,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **판단 기준 근거 (ADR-0004에 기록):**
 - **전세가율** = 보증금 / 매매가(시세). HUG 전세보증금반환보증 가입 요건이 2023.5.1부터 **90% 이하**. 업계 통용 안전권 **70% 이하**. → ≤70 안전, 70~80 주의, 80~90 위험, >90 매우 위험(보증 가입 불가).
 - **선순위 부담률** = (선순위 근저당 채권최고액 + 선순위 임차보증금 + 내 보증금) / 매매가. 100% 초과면 집을 팔아도 전액 회수 불가(깡통).
-- **경매 시 예상 회수액** = 매매가 × 낙찰가율(기본 0.8, 서울 아파트 평균 수준 가정) − 선순위 채권. 회수액 < 보증금이면 부족액 발생.
+- **경매 시 예상 회수액**: 낙찰가 = 매매가 × 낙찰가율(기본 0.8, 서울 아파트 평균 수준 가정, 보수적으로 절사). 배당 순서는 ① 소액임차인 최우선변제액(낙찰가의 1/2 한도, 시행령 제10조 제2항) → ② 선순위 근저당·선순위 보증금 → ③ 내 보증금 잔여분. 회수액 < 보증금이면 부족액 발생.
+- **총 부담률 경계 80/90%**: 전세가율 경계(70/80/90)에서 한 단계씩 보수적으로 올린 값. 선순위 채권이 있으면 같은 전세가율이라도 회수 위험이 커지므로 별도 축으로 본다(ADR-0004에 기록).
 - **소액임차인 최우선변제** (주택임대차보호법 시행령 제10·11조, 2023.2.21 개정): 서울 보증금 1억6,500만 이하 → 5,500만 우선변제 / 과밀억제권역·세종·용인·화성·김포 1억4,500만 → 4,800만 / 광역시 등 8,500만 → 2,800만 / 그 외 7,500만 → 2,500만.
 - **자금 부담**: 필요 대출 = 보증금 − 자기자금, 월 이자 = 대출 × 금리 / 12. 월 이자 / 월소득 > 30%면 경고(주거비 30% 규칙).
 
@@ -536,6 +537,18 @@ def test_expected_recovery_no_shortfall_is_zero():
     assert shortfall == 0
 
 
+def test_expected_recovery_when_proceeds_below_seniors():
+    # 낙찰 8,000 < 선순위 9,000 → 회수 0, 전액 부족
+    assert expected_recovery(10000, 0.8, 9000, 0, 3000) == (0, 3000)
+
+
+def test_expected_recovery_priority_paid_before_liens():
+    # 서울 소액임차인: 보증금 5,000, 매매가 10,000, 근저당 7,000
+    # 낙찰 8,000 → 최우선변제 min(5,000, 8,000/2)=4,000 먼저 → 잔여 8,000-4,000-7,000<0 → 0
+    # 회수 4,000, 부족 1,000 (최우선변제 없이 계산하면 회수 1,000이었을 것)
+    assert expected_recovery(10000, 0.8, 7000, 0, 5000, priority_amount=5000) == (4000, 1000)
+
+
 @pytest.mark.parametrize(
     "region,deposit,eligible,amount",
     [
@@ -572,6 +585,19 @@ def test_classify(jr, tb, shortfall, expected):
     assert classify(jr, tb, shortfall) == expected
 
 
+@pytest.mark.parametrize(
+    "jr,tb,expected",
+    [
+        (70.0, 70.0, RiskLevel.SAFE),  # "70% 이하 안전권" → 70.0 포함
+        (80.0, 80.0, RiskLevel.CAUTION),
+        (90.0, 90.0, RiskLevel.DANGER),  # HUG 한도 90% 이하 → 90.0은 보증 가입 가능
+        (60.0, 100.0, RiskLevel.DANGER),  # 100% 초과부터 깡통
+    ],
+)
+def test_classify_boundaries_are_inclusive(jr, tb, expected):
+    assert classify(jr, tb, 0) == expected
+
+
 def test_assess_full_case_danger():
     inp = JeonseInput(
         deposit=35000,
@@ -600,6 +626,30 @@ def test_assess_without_income_has_none_ratio():
     result = assess(inp)
     assert result.interest_to_income_ratio is None
     assert result.level == RiskLevel.SAFE
+
+
+def test_assess_small_tenant_priority_improves_recovery():
+    inp = JeonseInput(deposit=5000, market_price=10000, senior_liens=7000, region=Region.SEOUL)
+    result = assess(inp)
+    assert result.small_tenant_protected is True
+    assert result.small_tenant_priority_amount == 5000
+    assert result.expected_recovery == 4000
+    assert result.shortfall == 1000
+    assert any("최우선변제" in r and "먼저" in r for r in result.reasons)
+
+
+def test_income_ratio_warning_uses_unrounded_value():
+    # 월이자 30040*12%/12 = 300.4만원, 월소득 1,000만원 → 30.04% → 표시는 30.0이지만 경고는 나와야 함
+    inp = JeonseInput(deposit=30040, market_price=100000, own_capital=0, annual_income=12000, loan_rate=12.0)
+    result = assess(inp)
+    assert result.interest_to_income_ratio == 30.0
+    assert any("30%" in r for r in result.reasons)
+
+
+def test_no_loan_needed_has_no_loan_reason():
+    result = assess(JeonseInput(deposit=20000, market_price=50000, own_capital=25000))
+    assert result.required_loan == 0
+    assert not any("대출" in r for r in result.reasons)
 
 
 def test_assess_interest_burden_adds_reason():
@@ -716,11 +766,22 @@ def total_burden_ratio(deposit: int, senior_liens: int, senior_deposits: int, ma
 
 
 def expected_recovery(
-    market_price: int, auction_ratio: float, senior_liens: int, senior_deposits: int, deposit: int
+    market_price: int,
+    auction_ratio: float,
+    senior_liens: int,
+    senior_deposits: int,
+    deposit: int,
+    priority_amount: int = 0,
 ) -> tuple[int, int]:
-    """경매 시 (회수 가능액, 부족액). 낙찰가에서 선순위를 뺀 잔액이 내 보증금에 배당된다고 가정."""
+    """경매 시 (회수 가능액, 부족액).
+
+    배당 순서 가정: ① 소액임차인 최우선변제액(낙찰가의 1/2 한도) → ② 선순위 근저당·보증금 → ③ 내 보증금 잔여분.
+    낙찰가는 보수적으로 절사한다.
+    """
     proceeds = int(market_price * auction_ratio)
-    recovery = max(0, min(deposit, proceeds - senior_liens - senior_deposits))
+    priority = min(priority_amount, proceeds // 2)
+    remainder = max(0, proceeds - priority - senior_liens - senior_deposits)
+    recovery = min(deposit, priority + remainder)
     return recovery, deposit - recovery
 
 
@@ -744,15 +805,20 @@ def classify(jr: float, burden: float, shortfall: int) -> RiskLevel:
 def assess(inp: JeonseInput) -> RiskAssessment:
     jr = jeonse_ratio(inp.deposit, inp.market_price)
     burden = total_burden_ratio(inp.deposit, inp.senior_liens, inp.senior_deposits, inp.market_price)
-    recovery, shortfall = expected_recovery(
-        inp.market_price, inp.auction_ratio, inp.senior_liens, inp.senior_deposits, inp.deposit
-    )
     protected, priority_amount = small_tenant_protection(inp.region, inp.deposit)
+    recovery, shortfall = expected_recovery(
+        inp.market_price,
+        inp.auction_ratio,
+        inp.senior_liens,
+        inp.senior_deposits,
+        inp.deposit,
+        priority_amount=priority_amount,
+    )
     required_loan = max(0, inp.deposit - inp.own_capital)
     monthly_interest = required_loan * inp.loan_rate / 100 / 12
-    ratio_to_income = (
-        round(monthly_interest / (inp.annual_income / 12) * 100, 1) if inp.annual_income else None
-    )
+    # 비교는 반올림 전 값으로, 표시는 소수 1자리로 (30.04% → 표시 30.0, 경고는 발생)
+    ratio_raw = monthly_interest / (inp.annual_income / 12) * 100 if inp.annual_income else None
+    ratio_to_income = round(ratio_raw, 1) if ratio_raw is not None else None
     level = classify(jr, burden, shortfall)
 
     reasons: list[str] = []
@@ -770,12 +836,17 @@ def assess(inp: JeonseInput) -> RiskAssessment:
     else:
         reasons.append(f"낙찰가율 {inp.auction_ratio:.0%} 가정 경매 시에도 보증금 전액 회수 가능")
     if protected:
-        reasons.append(f"소액임차인 최우선변제 대상: 최대 {priority_amount:,}만원 우선 변제")
+        reasons.append(
+            f"소액임차인 최우선변제 대상: 최대 {priority_amount:,}만원을 선순위 채권보다 먼저 변제 "
+            "(위 회수액 계산에 반영, 낙찰가의 1/2 한도)"
+        )
     else:
         reasons.append("보증금이 소액임차인 기준을 초과하여 최우선변제 대상 아님")
     if required_loan:
-        reasons.append(f"필요 대출 {required_loan:,}만원, 금리 {inp.loan_rate}% 기준 월 이자 약 {monthly_interest:,.1f}만원")
-    if ratio_to_income is not None and ratio_to_income > HOUSING_COST_INCOME_LIMIT:
+        reasons.append(
+            f"필요 대출 {required_loan:,}만원, 금리 {inp.loan_rate:g}% 기준 월 이자 약 {monthly_interest:,.1f}만원"
+        )
+    if ratio_raw is not None and ratio_raw > HOUSING_COST_INCOME_LIMIT:
         reasons.append(f"월 이자가 월소득의 {ratio_to_income}%로 권고 상한 {HOUSING_COST_INCOME_LIMIT:.0f}% 초과")
 
     return RiskAssessment(
@@ -796,7 +867,7 @@ def assess(inp: JeonseInput) -> RiskAssessment:
 - [ ] **Step 5: 통과 확인**
 
 Run: `uv run pytest tests/domain -v`
-Expected: 전부 passed (parametrize 포함 약 20개)
+Expected: 전부 passed (parametrize 포함 약 30개)
 
 - [ ] **Step 6: 커밋**
 
@@ -2764,7 +2835,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - `0001-llm-openai.md`: 결정 OpenAI gpt-4.1-mini + text-embedding-3-small. 근거: langchain 생태계 1급 지원, tool calling 안정성, 한국어 품질, 비용(mini). 대안: Claude(문서 이해 강점, 비용 상승), Ollama(무료지만 한국어·속도·tool calling 신뢰도). 결과: 모델명은 `OPENAI_MODEL` 환경변수로 교체 가능하게 격리.
 - `0002-vector-store-chroma.md`: 결정 Chroma 로컬 persist. 근거: 수십~수백 청크 규모, 메타데이터 필터 지원, 서버 불필요. 대안: FAISS(메타데이터 약함), pgvector(운영형이지만 Docker 부담). 결과: 확장 시 `rag/retriever.py`만 교체.
 - `0003-multi-agent-supervisor.md`: 결정 `langgraph-supervisor` 패턴 + 4 워커. 근거: 역할 분리로 프롬프트 단순화·개별 테스트·트레이스 가독성, 핸드오프 도구 자동 생성. **위험 판단은 LLM이 아닌 순수 함수**로 두어 재현성·테스트 가능성 확보. `output_mode=full_history` 선택 이유(리포트 에이전트가 수치 원본을 봐야 함). 대안: 단일 ReAct 에이전트(도구 많아지면 라우팅 품질 저하), Swarm(피어 핸드오프, 흐름 예측 어려움). 트레이드오프: 호출 수 증가로 지연·비용 상승.
-- `0004-jeonse-risk-rules.md`: Task 3의 기준표(전세가율 70/80/90, 부담률 80/90/100, 낙찰가율 0.8 가정, 소액임차인 표, 주거비 30%)와 출처 URL, 한계(아파트 외 유형, 낙찰가율 지역 편차, 신탁·가압류 미반영).
+- `0004-jeonse-risk-rules.md`: Task 3의 기준표(전세가율 70/80/90, 부담률 80/90/100 — 전세가율 경계를 한 단계 보수적으로 올린 값, 낙찰가율 0.8 가정, 소액임차인 표, 주거비 30%)와 출처 URL, 경매 배당 순서 가정(최우선변제 → 선순위 → 내 보증금, 최우선변제는 낙찰가의 1/2 한도), 경계값 포함 규칙(70.0은 안전, 90.0은 HUG 가입 가능), 한계(낙찰가율 지역 편차, 신탁·가압류·당해세 미반영, 다가구 선순위 보증금은 사용자 입력 의존).
 - `0005-ragas-langchain-community-pin.md`: ragas 0.4.3이 `langchain_community.chat_models.vertexai`를 하드 import → community 0.4.x에서 제거됨. 0.3.31 고정으로 해결(langchain 1.3.18과 호환 확인 2026-09-02). 대안: ragas 미사용·자체 LLM-judge 구현(재현성↑, 공인 지표 신뢰↓), 평가 전용 별도 venv(운영 복잡). 결과: langchain-community를 직접 사용하지 않으므로 런타임 영향 없음. ragas 상위 수정 시 핀 해제.
 - `0006-uv-python312-streamlit.md`: uv(lock 재현성·속도), Python 3.12(라이브러리 호환 최광범위, 3.13은 일부 C 확장 미지원), Streamlit(파이썬 단일 스택으로 데모 속도, 대안 FastAPI+React는 포트폴리오 범위 대비 과함).
 
