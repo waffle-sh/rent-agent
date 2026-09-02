@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     raw_docs_dir: Path = PROJECT_ROOT / "data" / "raw"
     chroma_dir: Path = PROJECT_ROOT / "data" / "chroma"
     chroma_collection: str = "real_estate_knowledge"
-    # 54청크 코퍼스에서 상품 비교형 질의는 관련 섹션이 4~6개라
+    # 53청크 코퍼스에서 상품 비교형 질의는 관련 섹션이 4~6개라
     # k=4는 정답 섹션을 밀어냄 (RAGAS Q9 실측). ADR-0002
     retriever_k: int = 6
 

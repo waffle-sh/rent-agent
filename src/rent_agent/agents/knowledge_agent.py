@@ -9,6 +9,9 @@ from rent_agent.agents.prompts import KNOWLEDGE_PROMPT
 from rent_agent.config import Settings
 from rent_agent.rag.retriever import get_retriever
 
+# 도구 출력에서 문단을 구분하는 구분자. 평가 스크립트가 ToolMessage를 다시 문단으로 나눌 때도 사용.
+CONTEXT_SEPARATOR = "\n\n---\n\n"
+
 
 def make_knowledge_tool(retriever: BaseRetriever) -> BaseTool:
     @tool
@@ -20,7 +23,7 @@ def make_knowledge_tool(retriever: BaseRetriever) -> BaseTool:
         docs = retriever.invoke(query)
         if not docs:
             return "관련 문서를 찾지 못했습니다."
-        return "\n\n---\n\n".join(
+        return CONTEXT_SEPARATOR.join(
             f"[출처: {d.metadata.get('title', '')} | {d.metadata.get('source', '')} | "
             f"기준일 {d.metadata.get('effective_date', '')}]\n{d.page_content}"
             for d in docs

@@ -56,7 +56,10 @@ def test_real_corpus_chunking_is_stable():
     chunks = split_documents(load_markdown_docs(REAL_RAW))
     assert 40 <= len(chunks) <= 70
     assert not any(c.metadata["section"].startswith("출처") for c in chunks)
-    assert all(len(c.page_content) <= 1000 + 40 for c in chunks)  # 청크 + "[제목] " 접두
+    # 접두("[제목] ")를 뺀 본문이 chunk_size 이내
+    assert all(
+        len(c.page_content) - len(f"[{c.metadata['title']}] ") <= 1000 for c in chunks
+    )
     # 섹션 = 청크: 실제 문서의 어떤 ## 섹션도 둘로 갈리지 않아야 한다 (RAGAS Q9 회귀 방지)
     keys = [(c.metadata["file"], c.metadata["section"]) for c in chunks]
     assert len(keys) == len(set(keys)), [k for k in keys if keys.count(k) > 1]
