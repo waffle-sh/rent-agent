@@ -1910,7 +1910,9 @@ def test_split_respects_headers_and_keeps_metadata(tmp_path: Path):
     chunks = split_documents(docs, chunk_size=800, chunk_overlap=100)
     assert len(chunks) >= 2
     assert all(c.metadata["title"] == "임대차법" for c in chunks)
-    assert all(len(c.page_content) <= 800 for c in chunks)
+    # 문서 제목을 청크 앞에 붙여, 헤더만 있는 청크도 어떤 문서인지 알 수 있게 한다 (임베딩·LLM 모두에 유리)
+    assert all(c.page_content.startswith("[임대차법] ") for c in chunks)
+    assert all(len(c.page_content) <= 800 + len("[임대차법] ") for c in chunks)
 
 
 def test_build_vectorstore_persists_and_searches(tmp_path: Path):
@@ -1992,7 +1994,12 @@ def split_documents(docs: list[Document], chunk_size: int = 800, chunk_overlap: 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=SEPARATORS
     )
-    return splitter.split_documents(docs)
+    chunks = splitter.split_documents(docs)
+    # 청크 앞에 "[문서 제목] "을 붙인다. "## 보증금액 한도"처럼 맥락이 약한 헤더 청크도
+    # 어떤 문서(HUG 보증/버팀목 대출 등)의 내용인지 임베딩과 LLM이 알 수 있게 하기 위함.
+    for c in chunks:
+        c.page_content = f"[{c.metadata.get('title', '')}] {c.page_content}"
+    return chunks
 
 
 def build_vectorstore(
