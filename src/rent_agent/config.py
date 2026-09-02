@@ -35,7 +35,9 @@ class Settings(BaseSettings):
     chroma_collection: str = "real_estate_knowledge"
     retriever_k: int = 4
 
-    # LangSmith (환경변수만 있으면 langchain이 자동 트레이싱)
+    # LangSmith. 주의: pydantic-settings는 .env를 os.environ에 올리지 않는다.
+    # 트레이서는 os.environ만 읽으므로 진입점에서 agents.llm.configure_tracing()을 호출해야 한다.
+    langsmith_tracing: bool = False
     langsmith_api_key: str | None = None
     langsmith_project: str = "rent-agent"
 
