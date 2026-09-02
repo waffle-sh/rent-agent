@@ -1602,7 +1602,7 @@ from rent_agent.tools.market_stats import JeonseMarketSummary, summarize_jeonse
 from rent_agent.tools.molit_rent import HousingType, RentRecord
 
 
-def rec(apt="까치마을", area=39.6, deposit=40000, rent=0, day=1) -> RentRecord:
+def rec(apt="까치마을", area=39.6, deposit=40000, rent=0, day=1, contract="신규") -> RentRecord:
     return RentRecord(
         housing_type=HousingType.APARTMENT,
         building_name=apt,
@@ -1614,8 +1614,8 @@ def rec(apt="까치마을", area=39.6, deposit=40000, rent=0, day=1) -> RentReco
         deal_date=date(2026, 7, day),
         deposit=deposit,
         monthly_rent=rent,
-        contract_type="신규",
-        renewal_right_used=False,
+        contract_type=contract,
+        renewal_right_used=contract == "갱신",
     )
 
 
@@ -1641,9 +1641,50 @@ def test_building_name_partial_match_and_no_area_filter():
     assert s.count == 2
 
 
+def test_building_name_ignores_whitespace_and_case():
+    # 실제 API 표기 "강남 지웰홈스"(공백 포함)를 "강남지웰홈스"로 찾을 수 있어야 한다
+    records = [rec(apt="강남 지웰홈스"), rec(apt="Raemian Blesstige")]
+    assert summarize_jeonse(records, building_name="강남지웰홈스").count == 1
+    assert summarize_jeonse(records, building_name=" 강남  지웰홈스 ").count == 1
+    assert summarize_jeonse(records, building_name="raemian").count == 1
+
+
+def test_empty_building_name_means_no_filter():
+    records = [rec(apt="A"), rec(apt="B")]
+    assert summarize_jeonse(records, building_name="").count == 2
+    assert summarize_jeonse(records, building_name="   ").count == 2
+
+
+def test_new_contract_median_excludes_renewals():
+    # 갱신 계약은 5% 상한 때문에 2년 전 가격 → 시세 신호가 아님. 전체 중위값과 별도로 신규 중위값 제공
+    records = [
+        rec(deposit=40000, contract="갱신"),
+        rec(deposit=41000, contract="갱신"),
+        rec(deposit=50000, contract="신규"),
+        rec(deposit=52000, contract=""),  # 계약구분 미기재(2021년 이전 등)는 신규로 간주
+    ]
+    s = summarize_jeonse(records)
+    assert s.count == 4 and s.median_deposit == 45500
+    assert s.new_contract_count == 2
+    assert s.new_contract_median == 51000
+
+
+def test_new_contract_median_none_when_all_renewals():
+    s = summarize_jeonse([rec(deposit=40000, contract="갱신")])
+    assert s.count == 1 and s.new_contract_count == 0 and s.new_contract_median is None
+
+
 def test_empty_summary():
     s = summarize_jeonse([], building_name="없는단지")
-    assert s == JeonseMarketSummary(count=0, median_deposit=None, min_deposit=None, max_deposit=None, recent=[])
+    assert s == JeonseMarketSummary(
+        count=0, median_deposit=None, min_deposit=None, max_deposit=None, recent=[]
+    )
+    assert s.ratio_to_median(30000) is None
+
+
+def test_recent_ties_broken_by_deposit_desc():
+    records = [rec(deposit=40000, day=3), rec(deposit=48000, day=3), rec(deposit=44000, day=3)]
+    assert [r.deposit for r in summarize_jeonse(records).recent] == [48000, 44000, 40000]
 
 
 def test_compare_ratio():
@@ -1661,7 +1702,12 @@ Expected: FAIL — ModuleNotFoundError
 
 `src/rent_agent/tools/market_stats.py`:
 ```python
-"""실거래 레코드 → 전세 시세 요약. 중위값을 쓰는 이유: 소수 고가/저가 거래에 덜 민감."""
+"""실거래 레코드 → 전세 시세 요약.
+
+- 중위값을 쓰는 이유: 소수 고가/저가 거래에 덜 민감. (짝수 개면 두 중앙값 평균을 절사 — 만원 단위 오차 0.5 이하)
+- 갱신 계약은 증액 상한 5% 때문에 2년 전 가격을 반영하므로, 신규 계약만의 중위값을 별도로 제공한다.
+  계약구분이 비어 있는 행(2021년 이전 계약 등)은 신규로 간주한다.
+"""
 
 from __future__ import annotations
 
@@ -1670,6 +1716,13 @@ from statistics import median
 
 from rent_agent.tools.molit_rent import RentRecord
 
+RENEWAL = "갱신"
+
+
+def _norm(text: str) -> str:
+    """공백 제거 + 대소문자 무시. API 표기("강남 지웰홈스")와 사용자 입력("강남지웰홈스") 차이를 흡수."""
+    return "".join(text.split()).casefold()
+
 
 @dataclass(frozen=True)
 class JeonseMarketSummary:
@@ -1677,6 +1730,8 @@ class JeonseMarketSummary:
     median_deposit: int | None
     min_deposit: int | None
     max_deposit: int | None
+    new_contract_count: int = 0
+    new_contract_median: int | None = None  # 갱신 제외 중위값. 시세 비교 시 우선 사용
     recent: list[RentRecord] = field(default_factory=list)  # 최신순, 최대 5건
 
     def ratio_to_median(self, deposit: int) -> float | None:
@@ -1691,24 +1746,30 @@ def summarize_jeonse(
     area_m2: float | None = None,
     area_tolerance: float = 5.0,
 ) -> JeonseMarketSummary:
-    """순수 전세(월세 0)만 대상으로 건물명 부분일치·전용면적 ±허용치로 필터 후 요약. 주거 유형은 호출자가 이미 분리해 넘긴다."""
+    """순수 전세(월세 0)만 대상으로 건물명 부분일치(정규화)·전용면적 ±허용치로 필터 후 요약.
+    주거 유형은 호출자가 이미 분리해 넘긴다. building_name이 빈 문자열이면 필터하지 않는다."""
+    name_key = _norm(building_name) if building_name else ""
     filtered = [
         r
         for r in records
         if r.is_jeonse
-        and (building_name is None or building_name in r.building_name)
+        and (not name_key or name_key in _norm(r.building_name))
         and (area_m2 is None or abs(r.area_m2 - area_m2) <= area_tolerance)
     ]
     if not filtered:
         return JeonseMarketSummary(count=0, median_deposit=None, min_deposit=None, max_deposit=None)
 
     deposits = [r.deposit for r in filtered]
-    recent = sorted(filtered, key=lambda r: r.deal_date, reverse=True)[:5]
+    new_deposits = [r.deposit for r in filtered if r.contract_type != RENEWAL]
+    # 같은 날 거래가 많으므로 (거래일, 보증금) 내림차순으로 결정적 정렬
+    recent = sorted(filtered, key=lambda r: (r.deal_date, r.deposit), reverse=True)[:5]
     return JeonseMarketSummary(
         count=len(filtered),
         median_deposit=int(median(deposits)),
         min_deposit=min(deposits),
         max_deposit=max(deposits),
+        new_contract_count=len(new_deposits),
+        new_contract_median=int(median(new_deposits)) if new_deposits else None,
         recent=recent,
     )
 ```
@@ -1716,7 +1777,7 @@ def summarize_jeonse(
 - [ ] **Step 4: 통과 확인**
 
 Run: `uv run pytest tests/tools -v`
-Expected: 모두 passed
+Expected: 모두 passed (market_stats 9개)
 
 - [ ] **Step 5: 커밋**
 
@@ -2167,7 +2228,9 @@ MARKET_PROMPT = """당신은 전세 실거래가 조회 담당자입니다. 국�
 1. 사용자가 말한 지역명으로 find_region_code 를 호출해 시군구 코드를 찾습니다. 후보가 여럿이면 가장 구체적으로 일치하는 것을 고르고, 판단이 어려우면 후보를 나열해 되묻습니다.
 2. 주거 유형을 정합니다: 아파트 → apartment, 빌라·연립·다세대 → multi_house, 오피스텔 → officetel. 언급이 없으면 apartment로 조회하고 그 가정을 명시합니다.
 3. get_recent_jeonse_deals 를 호출해 최근 거래를 요약합니다.
-4. 결과는 주거 유형, 거래 건수, 보증금 중위값/최소/최대, 최근 거래 5건, 데이터 한계(건물명 표기 차이 가능, 신축·비등록 건물 누락 가능)를 포함해 간결히 보고합니다.
+4. 시세 기준값은 **신규 계약 중위값(new_contract_median)** 을 우선 사용합니다. 갱신 계약은 증액 상한 5% 때문에 2년 전 가격이라 시세가 아닙니다.
+   new_contract_count가 3건 미만이면 전체 중위값(median_deposit)을 쓰되 "갱신 포함"이라고 명시합니다.
+5. 결과는 주거 유형, 거래 건수(전체/신규), 기준 중위값과 그 근거, 최소/최대, 최근 거래 5건, 데이터 한계(건물명 표기 차이 가능, 신축·비등록 건물 누락 가능)를 포함해 간결히 보고합니다.
 숫자 단위는 '만원'입니다. 추측으로 시세를 만들지 않습니다. 한국어로 답합니다."""
 
 RISK_PROMPT = """당신은 전세 위험 판단 담당자입니다.
@@ -2185,7 +2248,7 @@ REPORT_PROMPT = """당신은 전세 계약 상담 리포트 작성자입니다. 
 
 ## 핵심 수치
 - 전세가율, 총 부담률, 경매 시 회수 가능액/부족액, 소액임차인 해당 여부, 필요 대출·월 이자(있으면 소득 대비 %)
-- 시세 비교(market_agent 결과가 있으면): 동일 단지 최근 전세 중위값 대비 %
+- 시세 비교(market_agent 결과가 있으면): 동일 건물 최근 **신규 계약** 전세 중위값 대비 % (신규 3건 미만이면 전체 중위값, 갱신 포함 명시)
 
 ## 이렇게 판단한 이유
 근거 문장들을 사회초년생 눈높이로 풀어서.
@@ -2370,8 +2433,9 @@ def test_get_recent_jeonse_deals_apartment_default():
         get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "building_name": "까치마을", "area_m2": 39.6, "months": 1})
     )
     assert out["housing_type"] == "apartment"
-    assert out["count"] == 1  # 픽스처: 까치마을 39.6㎡ 순수 전세 1건 (45,000)
+    assert out["count"] == 1  # 픽스처: 까치마을 39.6㎡ 순수 전세 1건 (45,000) — 갱신 계약
     assert out["median_deposit"] == 45000
+    assert out["new_contract_count"] == 0 and out["new_contract_median"] is None
     assert out["recent"][0]["building_name"] == "까치마을"
     assert out["recent"][0]["deal_date"] == "2026-07-10"
 
@@ -2380,8 +2444,9 @@ def test_get_recent_jeonse_deals_multi_house():
     _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
     out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "housing_type": "multi_house", "months": 1}))
     assert out["housing_type"] == "multi_house"
-    assert out["count"] == 2  # RH 픽스처 순수 전세 52,500 / 50,000
+    assert out["count"] == 2  # RH 픽스처 순수 전세 52,500 / 50,000 (계약구분 미기재 → 신규 간주)
     assert out["median_deposit"] == 51250
+    assert out["new_contract_count"] == 2 and out["new_contract_median"] == 51250
     assert out["recent"][0]["sub_type"] in ("연립", "다세대")
 
 
@@ -2463,7 +2528,8 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
         lawd_cd: find_region_code로 얻은 5자리 코드.
         housing_type: apartment(아파트) | multi_house(연립·다세대·빌라) | officetel(오피스텔).
         building_name: 건물/단지명 일부(선택). area_m2: 전용면적 ㎡(선택, ±5㎡).
-        반환 JSON: housing_type, count, median_deposit, min_deposit, max_deposit(만원), recent(최근 5건), months_queried."""
+        반환 JSON: housing_type, count, median_deposit(전체 중위값), new_contract_count, new_contract_median(갱신 제외 중위값 —
+        시세 비교에 우선 사용, 3건 미만이면 median_deposit로 대체하되 갱신 포함임을 명시), min/max_deposit(만원), recent(최근 5건), months_queried."""
         try:
             htype = HousingType(housing_type)
         except ValueError:
@@ -2485,6 +2551,8 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
             "median_deposit": summary.median_deposit,
             "min_deposit": summary.min_deposit,
             "max_deposit": summary.max_deposit,
+            "new_contract_count": summary.new_contract_count,
+            "new_contract_median": summary.new_contract_median,
             "recent": [
                 {**asdict(r), "housing_type": r.housing_type.value, "deal_date": r.deal_date.isoformat()}
                 for r in summary.recent
