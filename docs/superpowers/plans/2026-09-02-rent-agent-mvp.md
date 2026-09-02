@@ -1843,7 +1843,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `src/rent_agent/rag/__init__.py`, `src/rent_agent/rag/loader.py`, `src/rent_agent/rag/ingest.py`, `src/rent_agent/rag/retriever.py`, `scripts/ingest.py`
 - Test: `tests/rag/__init__.py`, `tests/rag/test_loader.py`, `tests/rag/test_ingest.py`
 
-**설계 근거:** 청크 800자/오버랩 100자 — 법령 조문 하나가 대개 300~800자라 조문 단위가 한 청크에 들어가고, 오버랩으로 조문 경계 손실을 완화. 마크다운 헤더(`## `)를 1차 분리자로 써서 조문/항목 경계를 우선 존중. 테스트는 `DeterministicFakeEmbedding`으로 OpenAI 호출 없이 수행.
+**설계 근거:** 테스트 컬렉션명은 chromadb 1.5 제약(3~512자)으로 `test_col`을 쓴다. 청크 800자/오버랩 100자 — 법령 조문 하나가 대개 300~800자라 조문 단위가 한 청크에 들어가고, 오버랩으로 조문 경계 손실을 완화. 마크다운 헤더(`## `)를 1차 분리자로 써서 조문/항목 경계를 우선 존중. 테스트는 `DeterministicFakeEmbedding`으로 OpenAI 호출 없이 수행.
 
 - [ ] **Step 1: 실패 테스트 (loader)**
 
@@ -1919,7 +1919,7 @@ def test_build_vectorstore_persists_and_searches(tmp_path: Path):
     raw = _write_docs(tmp_path)
     chroma_dir = tmp_path / "chroma"
     emb = DeterministicFakeEmbedding(size=64)
-    vs = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="t", reset=True)
+    vs = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="test_col", reset=True)
     assert vs._collection.count() >= 2
     results = vs.similarity_search("대항력", k=1)
     assert len(results) == 1
@@ -1930,9 +1930,9 @@ def test_reset_clears_previous(tmp_path: Path):
     raw = _write_docs(tmp_path)
     chroma_dir = tmp_path / "chroma"
     emb = DeterministicFakeEmbedding(size=64)
-    first = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="t", reset=True)
+    first = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="test_col", reset=True)
     n = first._collection.count()
-    second = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="t", reset=True)
+    second = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="test_col", reset=True)
     assert second._collection.count() == n  # 중복 적재 없음
 ```
 
@@ -1974,7 +1974,6 @@ def load_markdown_docs(raw_dir: Path) -> list[Document]:
 ```python
 """청킹 + Chroma 적재. 임베딩을 주입받아 테스트에서는 Fake, 운영에서는 OpenAI를 쓴다."""
 
-import shutil
 from pathlib import Path
 
 from langchain_chroma import Chroma
@@ -2005,9 +2004,13 @@ def split_documents(docs: list[Document], chunk_size: int = 800, chunk_overlap: 
 def build_vectorstore(
     raw_dir: Path, chroma_dir: Path, embedding: Embeddings, collection: str, reset: bool = False
 ) -> Chroma:
-    if reset and chroma_dir.exists():
-        shutil.rmtree(chroma_dir)
     chroma_dir.mkdir(parents=True, exist_ok=True)
+    if reset:
+        # 디렉터리를 지우는 대신 컬렉션만 비운다. 같은 경로를 이미 연 chromadb 클라이언트가 있으면
+        # rmtree 후 쓰기에서 "attempt to write a readonly database"(code 1032)가 나기 때문.
+        Chroma(
+            collection_name=collection, embedding_function=embedding, persist_directory=str(chroma_dir)
+        ).reset_collection()
     chunks = split_documents(load_markdown_docs(raw_dir))
     return Chroma.from_documents(
         documents=chunks,
@@ -2079,14 +2082,6 @@ if __name__ == "__main__":
 
 Run: `uv run pytest tests/rag -v`
 Expected: 5 passed
-
-`test_reset_clears_previous`가 chromadb의 "같은 경로에 이미 열린 클라이언트" 류 오류로 실패하면, `build_vectorstore`의 `reset` 처리를 `shutil.rmtree` 대신 아래처럼 바꾼다(컬렉션만 비우고 클라이언트는 유지):
-
-```python
-    if reset:
-        existing = Chroma(collection_name=collection, embedding_function=embedding, persist_directory=str(chroma_dir))
-        existing.reset_collection()
-```
 
 - [ ] **Step 6: 실제 적재 + 검색 스모크 (OpenAI 임베딩 사용, 소액 과금)**
 
