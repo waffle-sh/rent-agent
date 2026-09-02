@@ -3320,21 +3320,30 @@ import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from rent_agent.agents import supervisor
 from rent_agent.agents.llm import configure_tracing
-from rent_agent.agents.supervisor import build_graph
 from rent_agent.config import get_settings
 
-st.set_page_config(page_title="rent-agent · 전세 리스크 상담", page_icon="🏠", layout="wide")
+st.set_page_config(
+    page_title="rent-agent · 전세 리스크 상담", page_icon="🏠", layout="wide"
+)
 
 # UI 라벨 → market_agent 도구의 housing_type 값
-HOUSING_LABELS = {"아파트": "apartment", "연립·다세대(빌라)": "multi_house", "오피스텔": "officetel"}
+HOUSING_LABELS = {
+    "아파트": "apartment",
+    "연립·다세대(빌라)": "multi_house",
+    "오피스텔": "officetel",
+}
 
 
 @st.cache_resource
 def _graph():
     settings = get_settings()
     configure_tracing(settings)  # .env의 LangSmith 설정을 프로세스 환경으로
-    return build_graph(settings, checkpointer=InMemorySaver())
+    # `supervisor.build_graph`(모듈 속성)로 호출한다. Streamlit은 이 파일을 모듈이 아닌
+    # 스크립트로 exec하므로 테스트가 이 파일의 전역을 바꿔 끼울 수 없다.
+    # 모듈 속성으로 호출하면 호출 시점에 해석되어 monkeypatch가 통한다 (tests/app 참고).
+    return supervisor.build_graph(settings, checkpointer=InMemorySaver())
 
 
 def _run(prompt: str):
@@ -3360,7 +3369,10 @@ if "thread_id" not in st.session_state:
     st.session_state.chat = []
 
 st.title("🏠 rent-agent — 사회초년생 전세 상담")
-st.caption("법령·제도 질문과 전세 매물 위험 진단을 멀티에이전트가 처리합니다. 참고 정보이며 법률·금융 자문이 아닙니다.")
+st.caption(
+    "법령·제도 질문과 전세 매물 위험 진단을 멀티에이전트가 처리합니다. "
+    "참고 정보이며 법률·금융 자문이 아닙니다."
+)
 
 tab_chat, tab_diag = st.tabs(["💬 지식 Q&A", "🔎 전세 진단"])
 
@@ -3388,9 +3400,13 @@ with tab_diag:
         c4, c5, c6 = st.columns(3)
         deposit = c4.number_input("전세 보증금 (만원)", min_value=0, value=30000, step=500)
         price = c5.number_input("매매 시세 (만원)", min_value=0, value=50000, step=500)
-        liens = c6.number_input("선순위 근저당 채권최고액 (만원)", min_value=0, value=0, step=500)
+        liens = c6.number_input(
+            "선순위 근저당 채권최고액 (만원)", min_value=0, value=0, step=500
+        )
         c7, c8, c9 = st.columns(3)
-        senior_dep = c7.number_input("선순위 임차보증금 (만원, 다가구)", min_value=0, value=0, step=500)
+        senior_dep = c7.number_input(
+            "선순위 임차보증금 (만원, 다가구)", min_value=0, value=0, step=500
+        )
         capital = c8.number_input("자기자금 (만원)", min_value=0, value=0, step=500)
         income = c9.number_input("연소득 (만원, 선택)", min_value=0, value=0, step=100)
         rate = st.slider("전세대출 예상 금리 (%)", 0.0, 10.0, 3.5, 0.1)
@@ -3401,12 +3417,16 @@ with tab_diag:
             st.error("보증금과 매매 시세는 필수입니다.")
         else:
             parts = [
-                f"{region_text} {apt} {f'{area}㎡' if area else ''} {housing_label} 전세 계약을 검토 중입니다. "
+                f"{region_text} {apt} {f'{area}㎡' if area else ''} {housing_label} "
+                f"전세 계약을 검토 중입니다. "
                 f"주거 유형 코드는 {HOUSING_LABELS[housing_label]}입니다."
             ]
-            parts.append(f"보증금 {deposit}만원, 매매 시세 {price}만원, 선순위 근저당 채권최고액 {liens}만원, "
-                         f"선순위 임차보증금 {senior_dep}만원, 자기자금 {capital}만원, "
-                         f"{'연소득 ' + str(income) + '만원, ' if income else ''}예상 금리 {rate}%.")
+            parts.append(
+                f"보증금 {deposit}만원, 매매 시세 {price}만원, "
+                f"선순위 근저당 채권최고액 {liens}만원, "
+                f"선순위 임차보증금 {senior_dep}만원, 자기자금 {capital}만원, "
+                f"{'연소득 ' + str(income) + '만원, ' if income else ''}예상 금리 {rate}%."
+            )
             if apt:
                 parts.append("같은 건물(단지)의 최근 전세 시세와도 비교해 주세요.")
             parts.append("이 계약이 적절한지 판단하고 리포트를 작성해 주세요.")
@@ -3424,12 +3444,22 @@ with tab_diag:
 `tests/app/test_streamlit_smoke.py`:
 ```python
 """streamlit.testing.v1.AppTest: 실제 브라우저·LLM 없이 스크립트를 실행해 위젯 트리를 검사한다.
-build_graph를 가짜 그래프로 바꿔 끼워 UI 배선만 검증한다."""
+build_graph를 가짜 그래프로 바꿔 끼워 UI 배선만 검증한다.
 
+바꿔 끼우는 지점이 `rent_agent.agents.supervisor.build_graph`인 이유:
+AppTest는 streamlit_app.py를 `rent_agent.app.streamlit_app` 모듈이 아니라 독립 스크립트로
+exec하므로, 그 모듈 객체의 속성을 바꿔도 스크립트가 만든 전역에는 영향이 없다.
+앱이 `supervisor.build_graph(...)`처럼 모듈 속성으로 호출하면 호출 시점에 해석되어 통한다.
+"""
+
+from pathlib import Path
+
+import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from streamlit.testing.v1 import AppTest
 
-APP = "src/rent_agent/app/streamlit_app.py"
+# AppTest는 상대 경로를 호출한 파일 기준으로 푼다 → 레포 루트에서 절대 경로로 만든다.
+APP = str(Path(__file__).resolve().parents[2] / "src" / "rent_agent" / "app" / "streamlit_app.py")
 
 
 class FakeGraph:
@@ -3442,9 +3472,17 @@ class FakeGraph:
         return {
             "messages": [
                 HumanMessage(prompt),
-                AIMessage("", name="supervisor", tool_calls=[{"name": "transfer_to_risk_agent", "args": {}, "id": "c1"}]),
+                AIMessage(
+                    "",
+                    name="supervisor",
+                    tool_calls=[{"name": "transfer_to_risk_agent", "args": {}, "id": "c1"}],
+                ),
                 ToolMessage("ok", tool_call_id="c1", name="transfer_to_risk_agent"),
-                AIMessage("", name="risk_agent", tool_calls=[{"name": "assess_jeonse_risk", "args": {}, "id": "c2"}]),
+                AIMessage(
+                    "",
+                    name="risk_agent",
+                    tool_calls=[{"name": "assess_jeonse_risk", "args": {}, "id": "c2"}],
+                ),
                 ToolMessage("{}", tool_call_id="c2", name="assess_jeonse_risk"),
                 AIMessage("## 종합 판정: 위험\n테스트 리포트", name="supervisor"),
             ]
@@ -3453,9 +3491,11 @@ class FakeGraph:
 
 def _app(monkeypatch) -> tuple[AppTest, FakeGraph]:
     fake = FakeGraph()
-    import rent_agent.app.streamlit_app as mod
+    from rent_agent.agents import supervisor
 
-    monkeypatch.setattr(mod, "_graph", lambda: fake)
+    monkeypatch.setattr(supervisor, "build_graph", lambda *a, **kw: fake)
+    # @st.cache_resource는 프로세스 전역이라 테스트 간 가짜 그래프가 새어 나간다.
+    st.cache_resource.clear()
     at = AppTest.from_file(APP, default_timeout=30)
     return at, fake
 
@@ -3481,7 +3521,10 @@ def test_diagnosis_form_builds_prompt_with_housing_type_and_shows_report(monkeyp
     prompt = fake.calls[0]
     assert "multi_house" in prompt and "45000만원" in prompt and "60000만원" in prompt
     assert any("## 종합 판정: 위험" in m.value for m in at.markdown)
-    assert any("risk_agent → assess_jeonse_risk" in str(e) for e in at.expander)
+    # expander의 repr에는 자식 텍스트가 없으므로 자식 markdown 요소를 본다.
+    assert any(
+        "risk_agent → assess_jeonse_risk" in m.value for e in at.expander for m in e.markdown
+    )
 
 
 def test_diagnosis_form_requires_deposit_and_price(monkeypatch):
@@ -3494,7 +3537,9 @@ def test_diagnosis_form_requires_deposit_and_price(monkeypatch):
 ```
 
 Run: `uv run pytest tests/app -v`
-Expected: 3 passed. (AppTest의 위젯 인덱스는 페이지 위젯 순서를 따른다 — 폼 배치를 바꾸면 인덱스도 맞춘다.)
+Expected: 3 passed (약 50초 — 각 AppTest 실행이 langchain/chroma 스택을 임포트). 위젯 인덱스는 페이지 위젯 순서를 따른다 — 폼 배치를 바꾸면 인덱스도 맞춘다.
+
+**AppTest 실측 주의점 (2026-09-02):** ① `AppTest.from_file`은 스크립트를 `rent_agent.app.streamlit_app` 모듈이 아닌 독립 네임스페이스로 exec하므로 모듈 속성 패치가 통하지 않는다 → 앱은 `supervisor.build_graph(...)`를 모듈 속성으로 호출하고 테스트는 `rent_agent.agents.supervisor.build_graph`를 패치, `st.cache_resource.clear()`로 테스트 간 캐시 격리. ② 상대 경로는 테스트 파일 기준으로 풀리므로 절대 경로 사용. ③ `Expander`의 repr에는 자식 텍스트가 없으므로 `e.markdown`을 순회해 검사.
 
 - [ ] **Step 3: 수동 실행 확인 (실제 LLM)**
 
