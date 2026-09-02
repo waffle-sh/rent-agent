@@ -2,15 +2,21 @@
 
 - output_mode='full_history': report_agent가 다른 에이전트의 도구 결과(수치)를 직접 봐야 하고,
   UI에서 에이전트 호출 흐름을 그대로 보여 주기 위함.
-- preserve_worker_answer 노드: 통합 테스트에서 supervisor가 report_agent의 리포트를 자기 말로
-  바꿔 쓰며 "## 종합 판정" 헤더·면책 문구를 유실하는 것이 관측됨(2026-09-02, 3회 중 1회).
-  프롬프트 지시와 langgraph-supervisor의 forward_message 도구 모두 모델이 따르지 않을 수 있어
-  (도구 미호출 관측),
-  LLM 판단에 맡기지 않고 **결정적 후처리**로 보장한다: 마지막 사용자 메시지 이후 report_agent /
-  knowledge_agent의 최종 답이 있으면 supervisor의 마지막 메시지를 그 원문으로 교체한다.
+- 두 개의 결정적 후처리 (2026-09-02 통합 테스트 실측에 근거):
+  1) ensure_report: supervisor가 risk_agent 결과를 받은 뒤 report_agent를 건너뛰고 직접 답한 경우가
+     관측됨(2회 중 1회). 이번 턴에 assess_jeonse_risk가 실행됐는데 report_agent의 답이 없으면
+     그래프가 report_agent를 직접 실행한다.
+  2) preserve_worker_answer: supervisor가 report/knowledge 에이전트의 답을 재작성해 "## 종합 판정"
+     헤더·면책 문구를 유실한 경우가 관측됨(3회 중 1회).
+     forward_message 도구도 모델이 호출하지 않았다.
+     마지막 사용자 턴 이후 워커의 최종 답이 있으면 supervisor의 마지막 메시지를 원문으로 교체한다.
+  프롬프트 지시는 확률적이므로, 결과의 완결성·충실성은 LLM 판단에 맡기지 않고 그래프가 보장한다.
 """
 
-from langchain_core.messages import AIMessage, HumanMessage
+from collections.abc import Callable
+from typing import Literal
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph_supervisor import create_supervisor
@@ -24,34 +30,63 @@ from rent_agent.agents.risk_agent import build_risk_agent
 from rent_agent.config import Settings
 
 SUPERVISOR_NAME = "supervisor"
+REPORT_AGENT = "report_agent"
+RISK_TOOL = "assess_jeonse_risk"
 # 이 에이전트들의 답은 사용자에게 원문 그대로 가야 한다 (수치·근거 URL·면책 문구 보존)
-VERBATIM_AGENTS = ("report_agent", "knowledge_agent")
+VERBATIM_AGENTS = (REPORT_AGENT, "knowledge_agent")
+
+
+def _current_turn(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """마지막 HumanMessage 이후 구간 (멀티턴에서 이전 턴의 결과를 끌어오지 않도록)."""
+    last_human = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
+    return messages[last_human + 1 :]
+
+
+def _last_worker_answer(turn: list[BaseMessage], names: tuple[str, ...]) -> AIMessage | None:
+    """도구 호출이 달린 AIMessage(핸드오프)는 워커의 '답'이 아니므로 제외."""
+    return next(
+        (
+            m
+            for m in reversed(turn)
+            if isinstance(m, AIMessage) and m.name in names and not m.tool_calls and m.content
+        ),
+        None,
+    )
+
+
+def needs_report(state: MessagesState) -> Literal["report", "preserve"]:
+    """이번 턴에 위험 판단 도구가 실행됐는데 report_agent의 답이 없으면 리포트 단계로 보낸다."""
+    turn = _current_turn(state["messages"])
+    ran_risk = any(isinstance(m, ToolMessage) and m.name == RISK_TOOL for m in turn)
+    has_report = _last_worker_answer(turn, (REPORT_AGENT,)) is not None
+    return "report" if ran_risk and not has_report else "preserve"
+
+
+def make_report_node(report_agent) -> Callable[[MessagesState], dict]:
+    """report_agent를 단독 실행하고 결과 AIMessage에 이름을 붙인다
+    (supervisor 밖에서는 이름이 붙지 않음)."""
+
+    def run_report(state: MessagesState) -> dict:
+        before = len(state["messages"])
+        result = report_agent.invoke({"messages": state["messages"]})
+        new_messages = []
+        for m in result["messages"][before:]:
+            if isinstance(m, AIMessage):
+                m = m.model_copy(update={"name": REPORT_AGENT})
+            new_messages.append(m)
+        return {"messages": new_messages}
+
+    return run_report
 
 
 def preserve_worker_answer(state: MessagesState) -> dict:
     """supervisor의 마지막 답이 워커(report/knowledge)의 최종 답을 재작성한 것이면
     원문으로 교체한다.
-
-    - 마지막 HumanMessage 이후 구간만 본다 (멀티턴 대화에서 이전 턴의 리포트를 끌어오지 않도록).
-    - 도구 호출이 달린 AIMessage(핸드오프)는 워커의 '답'이 아니므로 제외한다.
-    - 워커 답이 없거나(예: supervisor가 되묻는 경우) 이미 동일하면 아무것도 바꾸지 않는다.
-    """
+    워커 답이 없거나(예: supervisor가 되묻는 경우) 이미 동일하면 아무것도 바꾸지 않는다."""
     messages = state["messages"]
     if not messages:
         return {}
-    last_human = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
-    tail = messages[last_human + 1 :]
-    worker = next(
-        (
-            m
-            for m in reversed(tail)
-            if isinstance(m, AIMessage)
-            and m.name in VERBATIM_AGENTS
-            and not m.tool_calls
-            and m.content
-        ),
-        None,
-    )
+    worker = _last_worker_answer(_current_turn(messages), VERBATIM_AGENTS)
     final = messages[-1]
     if worker is None or not isinstance(final, AIMessage) or final.name != SUPERVISOR_NAME:
         return {}
@@ -71,11 +106,12 @@ def preserve_worker_answer(state: MessagesState) -> dict:
 
 
 def build_graph(settings: Settings, checkpointer: BaseCheckpointSaver | None = None):
+    report_agent = build_report_agent(settings)
     agents = [
         build_knowledge_agent(settings),
         build_market_agent(settings),
         build_risk_agent(settings),
-        build_report_agent(settings),
+        report_agent,
     ]
     team = create_supervisor(
         agents,
@@ -88,8 +124,12 @@ def build_graph(settings: Settings, checkpointer: BaseCheckpointSaver | None = N
 
     outer = StateGraph(MessagesState)
     outer.add_node("team", team)
+    outer.add_node("report", make_report_node(report_agent))
     outer.add_node("preserve_worker_answer", preserve_worker_answer)
     outer.add_edge(START, "team")
-    outer.add_edge("team", "preserve_worker_answer")
+    outer.add_conditional_edges(
+        "team", needs_report, {"report": "report", "preserve": "preserve_worker_answer"}
+    )
+    outer.add_edge("report", "preserve_worker_answer")
     outer.add_edge("preserve_worker_answer", END)
     return outer.compile(checkpointer=checkpointer)

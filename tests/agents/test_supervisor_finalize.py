@@ -1,6 +1,6 @@
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from rent_agent.agents.supervisor import preserve_worker_answer
+from rent_agent.agents.supervisor import needs_report, preserve_worker_answer
 
 REPORT = "## 종합 판정: 위험\n...\n본 리포트는 참고 정보이며 법률·금융 자문이 아닙니다."
 
@@ -53,6 +53,60 @@ def test_uses_only_messages_after_last_human_turn():
         AIMessage("도움이 되었다니 다행입니다.", name="supervisor", id="s3"),
     ]
     assert preserve_worker_answer({"messages": msgs}) == {}
+
+
+def _risk_only_flow() -> list:
+    return [
+        HumanMessage("보증금 4.5억 시세 6억 진단해줘", id="h1"),
+        AIMessage(
+            "",
+            name="supervisor",
+            id="s1",
+            tool_calls=[{"name": "transfer_to_risk_agent", "args": {}, "id": "c1"}],
+        ),
+        ToolMessage("transferred", tool_call_id="c1", name="transfer_to_risk_agent", id="t1"),
+        AIMessage(
+            "",
+            name="risk_agent",
+            id="r1",
+            tool_calls=[{"name": "assess_jeonse_risk", "args": {}, "id": "c2"}],
+        ),
+        ToolMessage('{"level": "위험"}', tool_call_id="c2", name="assess_jeonse_risk", id="t2"),
+        AIMessage("전세가율 75%로 위험입니다.", name="risk_agent", id="r2"),
+        AIMessage(
+            "",
+            name="risk_agent",
+            id="r3",
+            tool_calls=[{"name": "transfer_back_to_supervisor", "args": {}, "id": "c3"}],
+        ),
+        ToolMessage("back", tool_call_id="c3", name="transfer_back_to_supervisor", id="t3"),
+        AIMessage("위험합니다. 조심하세요.", name="supervisor", id="s2"),
+    ]
+
+
+def test_needs_report_when_risk_tool_ran_without_report():
+    assert needs_report({"messages": _risk_only_flow()}) == "report"
+
+
+def test_no_report_needed_when_report_exists():
+    assert needs_report({"messages": _flow("요약")}) == "preserve"
+
+
+def test_no_report_needed_for_knowledge_only_turn():
+    msgs = [
+        HumanMessage("대항력?", id="h1"),
+        AIMessage("다음 날 0시.", name="knowledge_agent", id="k1"),
+        AIMessage("다음 날 0시.", name="supervisor", id="s1"),
+    ]
+    assert needs_report({"messages": msgs}) == "preserve"
+
+
+def test_needs_report_ignores_previous_turns():
+    msgs = _risk_only_flow() + [
+        HumanMessage("고마워", id="h2"),
+        AIMessage("네.", name="supervisor", id="s3"),
+    ]
+    assert needs_report({"messages": msgs}) == "preserve"
 
 
 def test_knowledge_answer_is_also_preserved():
