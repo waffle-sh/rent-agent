@@ -47,7 +47,7 @@ def test_jeonse_diagnosis_calls_risk_and_report(real_settings):
     called = _agents_called(result)
     assert {"risk_agent", "report_agent"} <= called
     final = result["messages"][-1].content
-    # forward_message로 리포트 원문이 그대로 전달됨
+    # preserve_worker_answer 후처리로 리포트 원문이 그대로 전달됨
     assert final.lstrip().startswith("## 종합 판정")
     assert "위험" in final  # 전세가율 75%, 총 부담률 95% → 위험
     assert "법률·금융 자문이 아닙니다" in final
