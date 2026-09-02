@@ -1843,7 +1843,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `src/rent_agent/rag/__init__.py`, `src/rent_agent/rag/loader.py`, `src/rent_agent/rag/ingest.py`, `src/rent_agent/rag/retriever.py`, `scripts/ingest.py`
 - Test: `tests/rag/__init__.py`, `tests/rag/test_loader.py`, `tests/rag/test_ingest.py`
 
-**설계 근거:** 테스트 컬렉션명은 chromadb 1.5 제약(3~512자)으로 `test_col`을 쓴다. 청크 800자/오버랩 100자 — 법령 조문 하나가 대개 300~800자라 조문 단위가 한 청크에 들어가고, 오버랩으로 조문 경계 손실을 완화. 마크다운 헤더(`## `)를 1차 분리자로 써서 조문/항목 경계를 우선 존중. 테스트는 `DeterministicFakeEmbedding`으로 OpenAI 호출 없이 수행.
+**설계 근거 (2026-09-02 실측 기반, Task 8 리뷰):**
+- **헤더 우선 분할**: `RecursiveCharacterTextSplitter`만 쓰면 `## ` 경계에서 자른 뒤 800자 미만 조각을 다시 병합해 "문서 서문 + 첫 조문"이 한 청크가 된다. 실제 저장소에서 "전입신고 대항력" 질의의 임베딩 거리가 병합 청크 1.23 vs 대항력 조문 단독 1.05로, 병합 때문에 1위를 놓쳤다. → `MarkdownHeaderTextSplitter`로 `#`/`##` 섹션을 먼저 나누고, 800자를 넘는 섹션만 문자 기준으로 추가 분할한다. 조문 하나가 대개 300~800자라 섹션 = 청크가 된다.
+- **`## 출처` 섹션 제외**: URL 목록이 코퍼스의 10%를 차지하며 top-4에 끼어든다. 출처는 메타데이터 `source`로 이미 제공된다.
+- **유사도 검색(MMR 아님)**: 코퍼스가 섹션당 1청크인 비중복 구조라 MMR의 다양성 항은 무관한 문서만 끌어온다(4개 질의 중 3개에서 관련 청크가 밀림). RAGAS 평가에서 중복이 문제로 나오면 그때 재검토.
+- **결정적 ID 업서트**: `from_documents`에 `ids=f"{file}#{i}"`를 넘겨 재적재가 중복을 만들지 않게 한다(`--no-reset`이 실제로 "유지 후 갱신"이 되도록).
+- 테스트 컬렉션명은 chromadb 1.5 제약(3~512자)으로 `test_col`. 테스트는 `DeterministicFakeEmbedding`으로 OpenAI 호출 없이 수행.
 
 - [ ] **Step 1: 실패 테스트 (loader)**
 
@@ -1879,6 +1884,12 @@ def test_load_missing_frontmatter_uses_filename(tmp_path: Path):
     docs = load_markdown_docs(tmp_path)
     assert docs[0].metadata["title"] == "b"
     assert docs[0].metadata["source"] == ""
+
+
+def test_null_frontmatter_value_becomes_empty_string(tmp_path: Path):
+    (tmp_path / "c.md").write_text("---\ntitle: 문서\nsource:\n---\n본문", encoding="utf-8")
+    docs = load_markdown_docs(tmp_path)
+    assert docs[0].metadata["source"] == ""  # "None" 문자열이 되면 안 됨
 ```
 
 - [ ] **Step 2: 실패 테스트 (ingest + retriever)**
@@ -1887,10 +1898,15 @@ def test_load_missing_frontmatter_uses_filename(tmp_path: Path):
 ```python
 from pathlib import Path
 
+from langchain_chroma import Chroma
 from langchain_core.embeddings import DeterministicFakeEmbedding
 
+from rent_agent.config import Settings
 from rent_agent.rag.ingest import build_vectorstore, split_documents
 from rent_agent.rag.loader import load_markdown_docs
+from rent_agent.rag.retriever import get_retriever
+
+REAL_RAW = Path(__file__).resolve().parents[2] / "data" / "raw"
 
 
 def _write_docs(tmp_path: Path) -> Path:
@@ -1898,21 +1914,46 @@ def _write_docs(tmp_path: Path) -> Path:
     raw.mkdir()
     (raw / "law.md").write_text(
         "---\ntitle: 임대차법\nsource: s\ncategory: law\n---\n"
+        "# 주택임대차보호법 핵심\n이 문서는 개요입니다.\n"
         "## 대항력\n" + "주택 인도와 전입신고를 하면 다음 날부터 대항력이 생긴다. " * 30
-        + "\n## 우선변제권\n" + "확정일자를 받으면 우선변제권이 생긴다. " * 30,
+        + "\n## 우선변제권\n" + "확정일자를 받으면 우선변제권이 생긴다. " * 30
+        + "\n## 출처\n- https://law.go.kr\n",
         encoding="utf-8",
     )
     return raw
 
 
-def test_split_respects_headers_and_keeps_metadata(tmp_path: Path):
+def test_each_section_is_its_own_chunk_and_preamble_not_merged(tmp_path: Path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.md").write_text(
+        "---\ntitle: 문서\n---\n# 제목\n서문 한 줄.\n## A 조문\n짧은 내용 A.\n## B 조문\n짧은 내용 B.\n## 출처\n- http://x",
+        encoding="utf-8",
+    )
+    chunks = split_documents(load_markdown_docs(raw))
+    sections = [c.metadata["section"] for c in chunks]
+    # 서문(H1)과 각 ## 섹션이 병합되지 않고 각각 한 청크. 출처는 제외.
+    assert sections == ["", "A 조문", "B 조문"]
+    assert chunks[1].page_content == "[문서] ## A 조문\n짧은 내용 A."
+
+
+def test_long_section_is_split_but_keeps_metadata(tmp_path: Path):
     docs = load_markdown_docs(_write_docs(tmp_path))
     chunks = split_documents(docs, chunk_size=800, chunk_overlap=100)
-    assert len(chunks) >= 2
+    assert len(chunks) >= 4  # 서문 1 + 대항력 ≥2 + 우선변제권 ≥2 (출처 제외)
     assert all(c.metadata["title"] == "임대차법" for c in chunks)
-    # 문서 제목을 청크 앞에 붙여, 헤더만 있는 청크도 어떤 문서인지 알 수 있게 한다 (임베딩·LLM 모두에 유리)
+    assert {c.metadata["section"] for c in chunks} == {"", "대항력", "우선변제권"}
     assert all(c.page_content.startswith("[임대차법] ") for c in chunks)
     assert all(len(c.page_content) <= 800 + len("[임대차법] ") for c in chunks)
+    assert not any("law.go.kr" in c.page_content for c in chunks)
+
+
+def test_real_corpus_chunking_is_stable():
+    # 실제 문서 5종에 대한 골든 값. 청킹 규칙이 바뀌면 의도적으로 갱신할 것.
+    chunks = split_documents(load_markdown_docs(REAL_RAW))
+    assert 40 <= len(chunks) <= 70
+    assert not any(c.metadata["section"].startswith("출처") for c in chunks)
+    assert all(len(c.page_content) <= 900 for c in chunks)
 
 
 def test_build_vectorstore_persists_and_searches(tmp_path: Path):
@@ -1920,20 +1961,31 @@ def test_build_vectorstore_persists_and_searches(tmp_path: Path):
     chroma_dir = tmp_path / "chroma"
     emb = DeterministicFakeEmbedding(size=64)
     vs = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="test_col", reset=True)
-    assert vs._collection.count() >= 2
-    results = vs.similarity_search("대항력", k=1)
-    assert len(results) == 1
+    n = vs._collection.count()
+    assert n >= 4
+    # 디스크에서 다시 열어도 같은 개수 → 실제로 persist 됨
+    reopened = Chroma(collection_name="test_col", embedding_function=emb, persist_directory=str(chroma_dir))
+    assert reopened._collection.count() == n
+    results = reopened.similarity_search("대항력", k=1)
     assert results[0].metadata["title"] == "임대차법"
 
 
-def test_reset_clears_previous(tmp_path: Path):
+def test_reingest_is_idempotent_with_and_without_reset(tmp_path: Path):
     raw = _write_docs(tmp_path)
     chroma_dir = tmp_path / "chroma"
     emb = DeterministicFakeEmbedding(size=64)
-    first = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="test_col", reset=True)
-    n = first._collection.count()
-    second = build_vectorstore(raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="test_col", reset=True)
-    assert second._collection.count() == n  # 중복 적재 없음
+    n = build_vectorstore(raw, chroma_dir, emb, "test_col", reset=True)._collection.count()
+    assert build_vectorstore(raw, chroma_dir, emb, "test_col", reset=True)._collection.count() == n
+    # 결정적 id(file#i) 업서트 → reset=False로 다시 적재해도 중복 없음
+    assert build_vectorstore(raw, chroma_dir, emb, "test_col", reset=False)._collection.count() == n
+
+
+def test_retriever_uses_plain_similarity_with_k(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CHROMA_DIR", str(tmp_path / "chroma"))
+    monkeypatch.setenv("RETRIEVER_K", "3")
+    retriever = get_retriever(Settings(), embedding=DeterministicFakeEmbedding(size=8))
+    assert retriever.search_type == "similarity"
+    assert retriever.search_kwargs == {"k": 3}
 ```
 
 - [ ] **Step 3: 실패 확인**
@@ -1959,11 +2011,12 @@ def load_markdown_docs(raw_dir: Path) -> list[Document]:
     docs: list[Document] = []
     for path in sorted(raw_dir.glob("*.md")):
         post = frontmatter.load(path, encoding="utf-8")
+        # Chroma 메타데이터는 str/int/float/bool만 허용 → 전부 str. 키가 있지만 값이 null이면 "None"이 아니라 ""로.
         meta = {
-            "title": str(post.get("title", path.stem)),
-            "source": str(post.get("source", "")),
-            "effective_date": str(post.get("effective_date", "")),
-            "category": str(post.get("category", "")),
+            "title": str(post.get("title") or path.stem),
+            "source": str(post.get("source") or ""),
+            "effective_date": str(post.get("effective_date") or ""),
+            "category": str(post.get("category") or ""),
             "file": path.name,
         }
         docs.append(Document(page_content=post.content.strip(), metadata=meta))
@@ -1972,7 +2025,14 @@ def load_markdown_docs(raw_dir: Path) -> list[Document]:
 
 `src/rent_agent/rag/ingest.py`:
 ```python
-"""청킹 + Chroma 적재. 임베딩을 주입받아 테스트에서는 Fake, 운영에서는 OpenAI를 쓴다."""
+"""청킹 + Chroma 적재. 임베딩을 주입받아 테스트에서는 Fake, 운영에서는 OpenAI를 쓴다.
+
+청킹 전략(근거는 계획 Task 8 "설계 근거"):
+1) MarkdownHeaderTextSplitter로 `#`/`##` 섹션 단위로 먼저 나눈다 — 서문과 첫 조문이 병합되지 않도록.
+2) `## 출처` 섹션은 제외한다 — URL 목록은 검색 노이즈이고 source는 메타데이터에 있다.
+3) chunk_size를 넘는 섹션만 문자 기준으로 추가 분할한다.
+4) 모든 청크 앞에 "[문서 제목] "을 붙인다 — 맥락이 약한 헤더 청크도 어느 문서인지 알 수 있게.
+"""
 
 from pathlib import Path
 
@@ -1980,25 +2040,48 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from rent_agent.config import Settings
 from rent_agent.rag.loader import load_markdown_docs
 
-# 마크다운 헤더 → 빈 줄 → 줄 → 문장 순으로 자른다. 조문/항목 경계를 우선 존중.
-SEPARATORS = ["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""]
+HEADERS = [("#", "h1"), ("##", "section")]
+EXCLUDED_SECTION_PREFIXES = ("출처",)
+FALLBACK_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
 
 
 def split_documents(docs: list[Document], chunk_size: int = 800, chunk_overlap: int = 100) -> list[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=SEPARATORS
+    header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=HEADERS, strip_headers=False)
+    char_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=FALLBACK_SEPARATORS
     )
-    chunks = splitter.split_documents(docs)
-    # 청크 앞에 "[문서 제목] "을 붙인다. "## 보증금액 한도"처럼 맥락이 약한 헤더 청크도
-    # 어떤 문서(HUG 보증/버팀목 대출 등)의 내용인지 임베딩과 LLM이 알 수 있게 하기 위함.
-    for c in chunks:
-        c.page_content = f"[{c.metadata.get('title', '')}] {c.page_content}"
+    chunks: list[Document] = []
+    for doc in docs:
+        for sec in header_splitter.split_text(doc.page_content):
+            section = str(sec.metadata.get("section", ""))
+            if section.startswith(EXCLUDED_SECTION_PREFIXES):
+                continue
+            meta = {**doc.metadata, "section": section}
+            pieces = [sec] if len(sec.page_content) <= chunk_size else char_splitter.split_documents([sec])
+            for piece in pieces:
+                chunks.append(
+                    Document(
+                        page_content=f"[{meta['title']}] {piece.page_content.strip()}",
+                        metadata=meta,
+                    )
+                )
     return chunks
+
+
+def chunk_ids(chunks: list[Document]) -> list[str]:
+    """파일명#순번. 같은 문서를 다시 적재하면 같은 id → Chroma upsert로 중복 없음."""
+    counters: dict[str, int] = {}
+    ids = []
+    for c in chunks:
+        f = c.metadata["file"]
+        counters[f] = counters.get(f, 0) + 1
+        ids.append(f"{f}#{counters[f]}")
+    return ids
 
 
 def build_vectorstore(
@@ -2015,6 +2098,7 @@ def build_vectorstore(
     return Chroma.from_documents(
         documents=chunks,
         embedding=embedding,
+        ids=chunk_ids(chunks),
         collection_name=collection,
         persist_directory=str(chroma_dir),
     )
@@ -2037,6 +2121,9 @@ def ingest(settings: Settings, reset: bool = True) -> int:
 
 `src/rent_agent/rag/retriever.py`:
 ```python
+"""리트리버 팩토리. 단순 유사도 top-k를 쓰는 이유: 코퍼스가 섹션당 1청크인 비중복 구조라
+MMR의 다양성 항은 무관한 문서만 끌어온다(실측: 4개 질의 중 3개에서 관련 청크가 밀림). 계획 Task 8 설계 근거 참고."""
+
 from langchain_chroma import Chroma
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStoreRetriever
@@ -2054,9 +2141,8 @@ def get_vectorstore(settings: Settings, embedding: Embeddings | None = None) -> 
 
 
 def get_retriever(settings: Settings, embedding: Embeddings | None = None) -> VectorStoreRetriever:
-    # MMR: 같은 조문의 인접 청크만 잔뜩 뽑히는 것을 막고 서로 다른 근거를 섞어 준다.
     return get_vectorstore(settings, embedding).as_retriever(
-        search_type="mmr", search_kwargs={"k": settings.retriever_k, "fetch_k": settings.retriever_k * 4}
+        search_type="similarity", search_kwargs={"k": settings.retriever_k}
     )
 ```
 
@@ -2081,7 +2167,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: 통과 확인**
 
 Run: `uv run pytest tests/rag -v`
-Expected: 5 passed
+Expected: 9 passed (loader 3, ingest/retriever 6)
 
 - [ ] **Step 6: 실제 적재 + 검색 스모크 (OpenAI 임베딩 사용, 소액 과금)**
 
@@ -2092,7 +2178,7 @@ Run: `uv run python -c "
 from rent_agent.config import get_settings
 from rent_agent.rag.retriever import get_retriever
 for d in get_retriever(get_settings()).invoke('전입신고 하면 언제부터 대항력이 생기나요'): print(d.metadata['title'], '|', d.page_content[:80].replace(chr(10),' '))"`
-Expected: 주택임대차보호법 문서의 대항력 청크가 상위에 나옴.
+Expected: 1위가 주택임대차보호법 문서의 `## 대항력 (제3조)` 청크 (헤더 우선 분할 전에는 HUG 신청 시기가 1위였음).
 
 - [ ] **Step 7: 커밋**
 
@@ -3076,7 +3162,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 `docs/adr/README.md`: ADR 목록 표(번호·제목·상태).
 
 - `0001-llm-openai.md`: 결정 OpenAI gpt-4.1-mini + text-embedding-3-small. 근거: langchain 생태계 1급 지원, tool calling 안정성, 한국어 품질, 비용(mini). 대안: Claude(문서 이해 강점, 비용 상승), Ollama(무료지만 한국어·속도·tool calling 신뢰도). 결과: 모델명은 `OPENAI_MODEL` 환경변수로 교체 가능하게 격리.
-- `0002-vector-store-chroma.md`: 결정 Chroma 로컬 persist. 근거: 수십~수백 청크 규모, 메타데이터 필터 지원, 서버 불필요. 대안: FAISS(메타데이터 약함), pgvector(운영형이지만 Docker 부담). 결과: 확장 시 `rag/retriever.py`만 교체.
+- `0002-vector-store-chroma.md`: 결정 Chroma 로컬 persist. 근거: 수십~수백 청크 규모, 메타데이터 필터 지원, 서버 불필요. 대안: FAISS(메타데이터 약함), pgvector(운영형이지만 Docker 부담). 결과: 확장 시 `rag/retriever.py`만 교체. **검색 전략 결정도 함께 기록**: 헤더 우선 분할(서문+첫 조문 병합으로 대항력 질의 1위 상실 실측), `## 출처` 제외, MMR 대신 단순 유사도(비중복 코퍼스에서 MMR이 관련 청크를 밀어냄 — 4개 질의 실측 표 포함), 결정적 id 업서트.
 - `0003-multi-agent-supervisor.md`: 결정 `langgraph-supervisor` 패턴 + 4 워커. 근거: 역할 분리로 프롬프트 단순화·개별 테스트·트레이스 가독성, 핸드오프 도구 자동 생성. **위험 판단은 LLM이 아닌 순수 함수**로 두어 재현성·테스트 가능성 확보. `output_mode=full_history` 선택 이유(리포트 에이전트가 수치 원본을 봐야 함). 대안: 단일 ReAct 에이전트(도구 많아지면 라우팅 품질 저하), Swarm(피어 핸드오프, 흐름 예측 어려움). 트레이드오프: 호출 수 증가로 지연·비용 상승.
 - `0004-jeonse-risk-rules.md`: Task 3의 기준표(전세가율 70/80/90, 부담률 80/90/100 — 전세가율 경계를 한 단계 보수적으로 올린 값, 낙찰가율 0.8 가정, 소액임차인 표, 주거비 30%)와 출처 URL, 경매 배당 순서 가정(최우선변제 → 선순위 → 내 보증금, 최우선변제는 낙찰가의 1/2 한도), 경계값 포함 규칙(70.0은 안전, 90.0은 HUG 가입 가능), 한계(낙찰가율 지역 편차, 신탁·가압류·당해세 미반영, 다가구 선순위 보증금은 사용자 입력 의존).
 - `0005-ragas-langchain-community-pin.md`: ragas 0.4.3이 `langchain_community.chat_models.vertexai`를 하드 import → community 0.4.x에서 제거됨. 0.3.31 고정으로 해결(langchain 1.3.18과 호환 확인 2026-09-02). 대안: ragas 미사용·자체 LLM-judge 구현(재현성↑, 공인 지표 신뢰↓), 평가 전용 별도 venv(운영 복잡). 결과: langchain-community를 직접 사용하지 않으므로 런타임 영향 없음. ragas 상위 수정 시 핀 해제.
