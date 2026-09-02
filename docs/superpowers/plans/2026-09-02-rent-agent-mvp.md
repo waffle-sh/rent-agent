@@ -3293,6 +3293,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `src/rent_agent/app/__init__.py`, `src/rent_agent/app/streamlit_app.py`, `.streamlit/config.toml`
+- Test: `tests/app/__init__.py`, `tests/app/test_streamlit_smoke.py` — `streamlit.testing.v1.AppTest`로 브라우저·LLM 없이 렌더링과 폼 제출을 검증(그래프를 가짜로 교체)
+
+**UI 설계 근거:** 그래프의 최종 답은 항상 `result["messages"][-1]`이다(정상 경로: supervisor 메시지, 원문 교체 포함 / 폴백 경로: report_agent 메시지). 에이전트 실행 흐름 expander는 포트폴리오에서 멀티에이전트 동작을 보여 주는 핵심 요소라 도구 호출·핸드오프를 순서대로 표시한다. `_graph()`는 `st.cache_resource`로 프로세스당 1회만 조립한다(에이전트 4개 + 임베딩 클라이언트 생성 비용).
 
 - [ ] **Step 1: 구현**
 
@@ -3414,7 +3417,86 @@ with tab_diag:
                 st.write("\n".join(_trace(result)) or "(추적 정보 없음)")
 ```
 
-- [ ] **Step 2: 수동 실행 확인**
+- [ ] **Step 2: 헤드리스 스모크 테스트 (LLM 없음)**
+
+`tests/app/__init__.py`: 빈 파일.
+
+`tests/app/test_streamlit_smoke.py`:
+```python
+"""streamlit.testing.v1.AppTest: 실제 브라우저·LLM 없이 스크립트를 실행해 위젯 트리를 검사한다.
+build_graph를 가짜 그래프로 바꿔 끼워 UI 배선만 검증한다."""
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from streamlit.testing.v1 import AppTest
+
+APP = "src/rent_agent/app/streamlit_app.py"
+
+
+class FakeGraph:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def invoke(self, inputs, config=None):
+        prompt = inputs["messages"][0].content
+        self.calls.append(prompt)
+        return {
+            "messages": [
+                HumanMessage(prompt),
+                AIMessage("", name="supervisor", tool_calls=[{"name": "transfer_to_risk_agent", "args": {}, "id": "c1"}]),
+                ToolMessage("ok", tool_call_id="c1", name="transfer_to_risk_agent"),
+                AIMessage("", name="risk_agent", tool_calls=[{"name": "assess_jeonse_risk", "args": {}, "id": "c2"}]),
+                ToolMessage("{}", tool_call_id="c2", name="assess_jeonse_risk"),
+                AIMessage("## 종합 판정: 위험\n테스트 리포트", name="supervisor"),
+            ]
+        }
+
+
+def _app(monkeypatch) -> tuple[AppTest, FakeGraph]:
+    fake = FakeGraph()
+    import rent_agent.app.streamlit_app as mod
+
+    monkeypatch.setattr(mod, "_graph", lambda: fake)
+    at = AppTest.from_file(APP, default_timeout=30)
+    return at, fake
+
+
+def test_page_renders_two_tabs_and_form(monkeypatch):
+    at, _ = _app(monkeypatch)
+    at.run()
+    assert not at.exception
+    assert [t.label for t in at.tabs] == ["💬 지식 Q&A", "🔎 전세 진단"]
+    assert at.selectbox[0].options == ["아파트", "연립·다세대(빌라)", "오피스텔"]
+    assert at.button[0].label == "진단하기"
+
+
+def test_diagnosis_form_builds_prompt_with_housing_type_and_shows_report(monkeypatch):
+    at, fake = _app(monkeypatch)
+    at.run()
+    at.selectbox[0].select("연립·다세대(빌라)")
+    at.number_input[1].set_value(45000)  # 보증금
+    at.number_input[2].set_value(60000)  # 매매 시세
+    at.button[0].click().run()
+    assert not at.exception
+    assert len(fake.calls) == 1
+    prompt = fake.calls[0]
+    assert "multi_house" in prompt and "45000만원" in prompt and "60000만원" in prompt
+    assert any("## 종합 판정: 위험" in m.value for m in at.markdown)
+    assert any("risk_agent → assess_jeonse_risk" in str(e) for e in at.expander)
+
+
+def test_diagnosis_form_requires_deposit_and_price(monkeypatch):
+    at, fake = _app(monkeypatch)
+    at.run()
+    at.number_input[1].set_value(0)
+    at.button[0].click().run()
+    assert fake.calls == []
+    assert at.error and "필수" in at.error[0].value
+```
+
+Run: `uv run pytest tests/app -v`
+Expected: 3 passed. (AppTest의 위젯 인덱스는 페이지 위젯 순서를 따른다 — 폼 배치를 바꾸면 인덱스도 맞춘다.)
+
+- [ ] **Step 3: 수동 실행 확인 (실제 LLM)**
 
 Run: `uv run streamlit run src/rent_agent/app/streamlit_app.py`
 확인 항목:
@@ -3423,10 +3505,10 @@ Run: `uv run streamlit run src/rent_agent/app/streamlit_app.py`
 3. 주거 유형 "연립·다세대(빌라)", 지역 "강남구", 건물명 비움 → 시세 조회가 multi_house로 수행되는지 실행 흐름/리포트에서 확인.
 4. LangSmith 대시보드에 트레이스 확인.
 
-- [ ] **Step 3: 커밋**
+- [ ] **Step 4: 커밋**
 
 ```bash
-git add src/rent_agent/app .streamlit
+git add src/rent_agent/app .streamlit tests/app
 git commit -m "feat: Streamlit UI (지식 Q&A 채팅 + 전세 진단 폼 + 에이전트 흐름 표시)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
