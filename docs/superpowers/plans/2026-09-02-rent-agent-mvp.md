@@ -331,7 +331,9 @@ def test_settings_reads_env(monkeypatch):
     s = Settings(_env_file=None)
     assert s.openai_api_key == "sk-abc"
     assert s.openai_model == "gpt-4.1-mini"
-    assert s.apartment_openapi_endpoint.startswith("https://apis.data.go.kr")
+    assert s.apartment_openapi_endpoint.endswith("/RTMSDataSvcAptRent")
+    assert s.multi_house_openapi_endpoint.endswith("/RTMSDataSvcRHRent")
+    assert s.office_openapi_endpoint.endswith("/RTMSDataSvcOffiRent")
 
 
 def test_apartment_key_is_url_decoded(monkeypatch):
@@ -375,9 +377,11 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4.1-mini"
     openai_embedding_model: str = "text-embedding-3-small"
 
-    # 국토부 아파트 전월세 실거래가 (공공데이터포털)
+    # 국토부 전월세 실거래가 (공공데이터포털). 서비스 키 하나로 세 API 모두 호출한다.
     apartment_openapi_key: str
     apartment_openapi_endpoint: str = "https://apis.data.go.kr/1613000/RTMSDataSvcAptRent"
+    multi_house_openapi_endpoint: str = "https://apis.data.go.kr/1613000/RTMSDataSvcRHRent"  # 연립·다세대
+    office_openapi_endpoint: str = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiRent"  # 오피스텔
     molit_use_mock: bool = False
 
     # RAG
@@ -407,10 +411,23 @@ def get_settings() -> Settings:
 Run: `uv run pytest tests/test_config.py -v`
 Expected: 3 passed
 
-- [ ] **Step 5: 커밋**
+- [ ] **Step 5: `.env.example`에 추가 엔드포인트 반영**
+
+`.env.example`의 공공데이터포털 블록을 아래로 교체한다:
+```
+# 공공데이터포털 - 국토교통부 전월세 실거래가 (Encoding 키 그대로 붙여넣기. 키 하나로 세 API 모두 호출)
+APARTMENT_OPENAPI_KEY=...
+APARTMENT_OPENAPI_ENDPOINT=https://apis.data.go.kr/1613000/RTMSDataSvcAptRent
+MULTI_HOUSE_OPENAPI_ENDPOINT=https://apis.data.go.kr/1613000/RTMSDataSvcRHRent
+OFFICE_OPENAPI_ENDPOINT=https://apis.data.go.kr/1613000/RTMSDataSvcOffiRent
+# true면 API 대신 tests/fixtures/rent_response*.xml 사용 (키 없이 개발용)
+MOLIT_USE_MOCK=false
+```
+
+- [ ] **Step 6: 커밋**
 
 ```bash
-git add src/rent_agent/config.py tests/test_config.py
+git add src/rent_agent/config.py tests/test_config.py .env.example
 git commit -m "feat: pydantic-settings 기반 Settings 및 공공데이터 키 디코딩
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -874,17 +891,37 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 5: 실거래가 API 클라이언트 + XML 파서 + Mock (molit_rent.py)
+### Task 5: 실거래가 API 클라이언트 + XML 파서 + Mock (molit_rent.py) — 아파트·연립다세대·오피스텔
 
 **Files:**
-- Create: `src/rent_agent/tools/molit_rent.py`, `tests/fixtures/rent_response.xml`, `tests/fixtures/rent_error.xml`
+- Create: `src/rent_agent/tools/molit_rent.py`, `tests/fixtures/rent_response.xml`, `tests/fixtures/rent_response_rh.xml`, `tests/fixtures/rent_response_offi.xml`, `tests/fixtures/rent_error.xml`
 - Test: `tests/tools/test_molit_rent.py`
 
-- [ ] **Step 1: 픽스처 작성 (2026-09-02 실제 응답 기반, 필드명 그대로)**
+**배경 (2026-09-02 실측):** 국토부 전월세 실거래가 API는 주거 유형별로 서비스가 나뉜다. 세 API 모두 같은 서비스 키, 같은 파라미터(`LAWD_CD`, `DEAL_YMD`, `pageNo`, `numOfRows`), 같은 XML 골격을 쓰고 **건물명 필드만 다르다**. 사회초년생 임차 수요는 빌라·오피스텔이 많아 세 유형을 모두 지원한다.
 
-`tests/fixtures/rent_response.xml`:
+| 유형 | 서비스 경로 | 오퍼레이션 | 건물명 필드 | 특이 필드 |
+|---|---|---|---|---|
+| 아파트 | `RTMSDataSvcAptRent` | `getRTMSDataSvcAptRent` | `aptNm` | — |
+| 연립·다세대 | `RTMSDataSvcRHRent` | `getRTMSDataSvcRHRent` | `mhouseNm` | `houseType`(연립/다세대) |
+| 오피스텔 | `RTMSDataSvcOffiRent` | `getRTMSDataSvcOffiRent` | `offiNm` | `sggNm` |
+
+공통 필드: `buildYear, dealYear, dealMonth, dealDay, deposit("100,000" 만원·콤마), monthlyRent("0"이면 전세), excluUseAr, floor, umdNm, jibun, sggCd, contractType, useRRRight`, body의 `totalCount`. 에러 시 루트가 `OpenAPI_ServiceResponse`, `cmmMsgHeader/errMsg`.
+
+- [ ] **Step 1: 픽스처 작성 (실제 응답 기반, 필드명 그대로)**
+
+`tests/fixtures/rent_response.xml` (아파트):
 ```xml
 <?xml version="1.0" encoding="utf-8" standalone="yes"?><response><header><resultCode>000</resultCode><resultMsg>OK</resultMsg></header><body><items><item><aptNm>디에이치자이개포</aptNm><aptSeq>11680-4988</aptSeq><buildYear>2021</buildYear><contractTerm> </contractTerm><contractType> </contractType><dealDay>24</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>100,000</deposit><excluUseAr>76.46</excluUseAr><floor>12</floor><jibun>743</jibun><monthlyRent>200</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>일원동</umdNm><useRRRight> </useRRRight></item><item><aptNm>까치마을</aptNm><aptSeq>11680-314</aptSeq><buildYear>1993</buildYear><contractTerm>26.08~28.08</contractTerm><contractType>신규</contractType><dealDay>18</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>20,000</deposit><excluUseAr>39.6</excluUseAr><floor>11</floor><jibun>746</jibun><monthlyRent>90</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>수서동</umdNm><useRRRight> </useRRRight></item><item><aptNm>까치마을</aptNm><aptSeq>11680-314</aptSeq><buildYear>1993</buildYear><contractTerm>26.08~28.08</contractTerm><contractType>갱신</contractType><dealDay>10</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>45,000</deposit><excluUseAr>39.6</excluUseAr><floor>5</floor><jibun>746</jibun><monthlyRent>0</monthlyRent><preDeposit>40,000</preDeposit><preMonthlyRent>0</preMonthlyRent><sggCd>11680</sggCd><umdNm>수서동</umdNm><useRRRight>사용</useRRRight></item><item><aptNm>까치마을</aptNm><aptSeq>11680-314</aptSeq><buildYear>1993</buildYear><contractTerm> </contractTerm><contractType>신규</contractType><dealDay>3</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>47,000</deposit><excluUseAr>49.5</excluUseAr><floor>8</floor><jibun>746</jibun><monthlyRent>0</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>수서동</umdNm><useRRRight> </useRRRight></item></items><numOfRows>4</numOfRows><pageNo>1</pageNo><totalCount>1265</totalCount></body></response>
+```
+
+`tests/fixtures/rent_response_rh.xml` (연립·다세대, 순수 전세 2건 포함: 52,500 / 50,000):
+```xml
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><response><header><resultCode>000</resultCode><resultMsg>OK</resultMsg></header><body><items><item><buildYear>2018</buildYear><contractTerm> </contractTerm><contractType> </contractType><dealDay>5</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>31,300</deposit><excluUseAr>27.72</excluUseAr><floor>4</floor><houseType>다세대</houseType><jibun>1193-5</jibun><mhouseNm>개포비버리하임</mhouseNm><monthlyRent>10</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>개포동</umdNm><useRRRight> </useRRRight></item><item><buildYear>1997</buildYear><contractTerm> </contractTerm><contractType> </contractType><dealDay>13</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>10,000</deposit><excluUseAr>37.8</excluUseAr><floor>1</floor><houseType>연립</houseType><jibun>698-27</jibun><mhouseNm>하이레지던스</mhouseNm><monthlyRent>40</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>역삼동</umdNm><useRRRight> </useRRRight></item><item><buildYear>2020</buildYear><contractTerm> </contractTerm><contractType> </contractType><dealDay>18</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>52,500</deposit><excluUseAr>53.15</excluUseAr><floor>6</floor><houseType>다세대</houseType><jibun>1195-2</jibun><mhouseNm>안트레</mhouseNm><monthlyRent>0</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>개포동</umdNm><useRRRight> </useRRRight></item><item><buildYear>1987</buildYear><contractTerm> </contractTerm><contractType> </contractType><dealDay>4</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>50,000</deposit><excluUseAr>72.15</excluUseAr><floor>1</floor><houseType>연립</houseType><jibun>984-9</jibun><mhouseNm>경일빌라비동</mhouseNm><monthlyRent>0</monthlyRent><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><umdNm>대치동</umdNm><useRRRight> </useRRRight></item></items><numOfRows>4</numOfRows><pageNo>1</pageNo><totalCount>590</totalCount></body></response>
+```
+
+`tests/fixtures/rent_response_offi.xml` (오피스텔, 전부 월세 → 순수 전세 0건):
+```xml
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><response><header><resultCode>000</resultCode><resultMsg>OK</resultMsg></header><body><items><item><buildYear>2014</buildYear><contractTerm> </contractTerm><contractType> </contractType><dealDay>29</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>1,000</deposit><excluUseAr>25.16</excluUseAr><floor>2</floor><jibun>662</jibun><monthlyRent>85</monthlyRent><offiNm>강남 지웰홈스</offiNm><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><sggNm>강남구</sggNm><umdNm>자곡동</umdNm><useRRRight> </useRRRight></item><item><buildYear>2014</buildYear><contractTerm> </contractTerm><contractType> </contractType><dealDay>31</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>15,700</deposit><excluUseAr>25.16</excluUseAr><floor>5</floor><jibun>662</jibun><monthlyRent>20</monthlyRent><offiNm>강남 지웰홈스</offiNm><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><sggNm>강남구</sggNm><umdNm>자곡동</umdNm><useRRRight> </useRRRight></item><item><buildYear>2014</buildYear><contractTerm> </contractTerm><contractType> </contractType><dealDay>9</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>15,500</deposit><excluUseAr>26.71</excluUseAr><floor>3</floor><jibun>662</jibun><monthlyRent>15</monthlyRent><offiNm>강남 지웰홈스</offiNm><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><sggNm>강남구</sggNm><umdNm>자곡동</umdNm><useRRRight> </useRRRight></item><item><buildYear>2014</buildYear><contractTerm>26.09~28.08</contractTerm><contractType>신규</contractType><dealDay>25</dealDay><dealMonth>7</dealMonth><dealYear>2026</dealYear><deposit>20,000</deposit><excluUseAr>50.31</excluUseAr><floor>1</floor><jibun>662</jibun><monthlyRent>100</monthlyRent><offiNm>강남 지웰홈스</offiNm><preDeposit> </preDeposit><preMonthlyRent> </preMonthlyRent><sggCd>11680</sggCd><sggNm>강남구</sggNm><umdNm>자곡동</umdNm><useRRRight> </useRRRight></item></items><numOfRows>4</numOfRows><pageNo>1</pageNo><totalCount>339</totalCount></body></response>
 ```
 
 `tests/fixtures/rent_error.xml`:
@@ -910,6 +947,8 @@ import httpx
 import pytest
 
 from rent_agent.tools.molit_rent import (
+    HOUSING_SPECS,
+    HousingType,
     MockMolitRentClient,
     MolitApiError,
     MolitRentClient,
@@ -918,15 +957,25 @@ from rent_agent.tools.molit_rent import (
 )
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
+ENDPOINTS = {
+    HousingType.APARTMENT: "https://apis.data.go.kr/1613000/RTMSDataSvcAptRent",
+    HousingType.MULTI_HOUSE: "https://apis.data.go.kr/1613000/RTMSDataSvcRHRent",
+    HousingType.OFFICETEL: "https://apis.data.go.kr/1613000/RTMSDataSvcOffiRent",
+}
 
 
-def test_parse_rent_xml_records_and_total():
-    records, total = parse_rent_xml((FIXTURES / "rent_response.xml").read_text(encoding="utf-8"))
+def _xml(name: str) -> str:
+    return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def test_parse_apartment_records_and_total():
+    records, total = parse_rent_xml(_xml("rent_response.xml"), HousingType.APARTMENT)
     assert total == 1265
     assert len(records) == 4
-    first = records[0]
-    assert first == RentRecord(
-        apt_name="디에이치자이개포",
+    assert records[0] == RentRecord(
+        housing_type=HousingType.APARTMENT,
+        building_name="디에이치자이개포",
+        sub_type="",
         dong="일원동",
         area_m2=76.46,
         floor=12,
@@ -940,7 +989,7 @@ def test_parse_rent_xml_records_and_total():
 
 
 def test_parse_handles_comma_deposit_and_renewal_flag():
-    records, _ = parse_rent_xml((FIXTURES / "rent_response.xml").read_text(encoding="utf-8"))
+    records, _ = parse_rent_xml(_xml("rent_response.xml"), HousingType.APARTMENT)
     renewed = records[2]
     assert renewed.deposit == 45000
     assert renewed.monthly_rent == 0
@@ -949,50 +998,85 @@ def test_parse_handles_comma_deposit_and_renewal_flag():
     assert renewed.contract_type == "갱신"
 
 
+def test_parse_multi_house_uses_mhouseNm_and_houseType():
+    records, total = parse_rent_xml(_xml("rent_response_rh.xml"), HousingType.MULTI_HOUSE)
+    assert total > 0 and len(records) == 4
+    first = records[0]
+    assert first.housing_type == HousingType.MULTI_HOUSE
+    assert first.building_name == "개포비버리하임"
+    assert first.sub_type == "다세대"
+    assert first.deposit == 31300
+    jeonse = [r for r in records if r.is_jeonse]
+    assert sorted(r.deposit for r in jeonse) == [50000, 52500]
+
+
+def test_parse_officetel_uses_offiNm():
+    records, _ = parse_rent_xml(_xml("rent_response_offi.xml"), HousingType.OFFICETEL)
+    assert len(records) == 4
+    assert records[0].housing_type == HousingType.OFFICETEL
+    assert records[0].building_name == "강남 지웰홈스"
+    assert records[0].sub_type == ""
+    assert not any(r.is_jeonse for r in records)
+
+
 def test_parse_error_response_raises():
     with pytest.raises(MolitApiError, match="SERVICE_KEY_IS_NOT_REGISTERED_ERROR"):
-        parse_rent_xml((FIXTURES / "rent_error.xml").read_text(encoding="utf-8"))
+        parse_rent_xml(_xml("rent_error.xml"), HousingType.APARTMENT)
 
 
 def test_parse_empty_items():
     xml = (
-        '<response><header><resultCode>000</resultCode><resultMsg>OK</resultMsg></header>'
+        "<response><header><resultCode>000</resultCode><resultMsg>OK</resultMsg></header>"
         "<body><items/><numOfRows>10</numOfRows><pageNo>1</pageNo><totalCount>0</totalCount></body></response>"
     )
-    records, total = parse_rent_xml(xml)
+    records, total = parse_rent_xml(xml, HousingType.APARTMENT)
     assert records == [] and total == 0
 
 
-def test_client_sends_decoded_key_once(monkeypatch):
-    captured = {}
+def test_client_sends_decoded_key_once_and_uses_operation_per_type():
+    captured: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured["url"] = str(request.url)
-        return httpx.Response(200, text=(FIXTURES / "rent_response.xml").read_text(encoding="utf-8"))
+        captured.append(str(request.url))
+        body = "rent_response_rh.xml" if "RHRent" in str(request.url) else "rent_response.xml"
+        return httpx.Response(200, text=_xml(body))
 
-    transport = httpx.MockTransport(handler)
-    client = MolitRentClient(
-        endpoint="https://apis.data.go.kr/1613000/RTMSDataSvcAptRent",
-        service_key="abc+def==",
-        http=httpx.Client(transport=transport),
-    )
-    records = client.fetch(lawd_cd="11680", deal_ymd="202607")
-    assert len(records) == 4
+    client = MolitRentClient(ENDPOINTS, service_key="abc+def==", http=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    apt = client.fetch(lawd_cd="11680", deal_ymd="202607")
+    rh = client.fetch(lawd_cd="11680", deal_ymd="202607", housing_type=HousingType.MULTI_HOUSE)
+
+    assert len(apt) == 4 and apt[0].housing_type == HousingType.APARTMENT
+    assert len(rh) == 4 and rh[0].housing_type == HousingType.MULTI_HOUSE
+    assert captured[0].startswith("https://apis.data.go.kr/1613000/RTMSDataSvcAptRent/getRTMSDataSvcAptRent?")
+    assert captured[1].startswith("https://apis.data.go.kr/1613000/RTMSDataSvcRHRent/getRTMSDataSvcRHRent?")
     # httpx가 한 번만 인코딩: '+' → %2B, '=' → %3D
-    assert "serviceKey=abc%2Bdef%3D%3D" in captured["url"]
-    assert "LAWD_CD=11680" in captured["url"] and "DEAL_YMD=202607" in captured["url"]
+    assert "serviceKey=abc%2Bdef%3D%3D" in captured[0]
+    assert "LAWD_CD=11680" in captured[0] and "DEAL_YMD=202607" in captured[0]
 
 
 def test_client_http_error_wrapped():
     transport = httpx.MockTransport(lambda req: httpx.Response(500, text="boom"))
-    client = MolitRentClient(endpoint="https://x", service_key="k", http=httpx.Client(transport=transport))
+    client = MolitRentClient(ENDPOINTS, service_key="k", http=httpx.Client(transport=transport))
     with pytest.raises(MolitApiError):
         client.fetch(lawd_cd="11680", deal_ymd="202607")
 
 
-def test_mock_client_returns_fixture():
-    records = MockMolitRentClient().fetch(lawd_cd="11680", deal_ymd="202607")
+def test_client_missing_endpoint_for_type():
+    client = MolitRentClient({HousingType.APARTMENT: "https://x"}, service_key="k")
+    with pytest.raises(MolitApiError, match="officetel"):
+        client.fetch("11680", "202607", housing_type=HousingType.OFFICETEL)
+
+
+@pytest.mark.parametrize("housing_type", list(HousingType))
+def test_mock_client_returns_fixture_per_type(housing_type):
+    records = MockMolitRentClient().fetch(lawd_cd="11680", deal_ymd="202607", housing_type=housing_type)
     assert len(records) == 4
+    assert all(r.housing_type == housing_type for r in records)
+
+
+def test_housing_specs_cover_all_types():
+    assert set(HOUSING_SPECS) == set(HousingType)
 ```
 
 - [ ] **Step 3: 실패 확인**
@@ -1004,33 +1088,56 @@ Expected: FAIL — ModuleNotFoundError
 
 `src/rent_agent/tools/molit_rent.py`:
 ```python
-"""국토교통부 아파트 전월세 실거래가 API 클라이언트.
+"""국토교통부 전월세 실거래가 API 클라이언트 (아파트 / 연립·다세대 / 오피스텔).
 
-- 문서: 공공데이터포털 "국토교통부_아파트 전월세 실거래가 자료" (RTMSDataSvcAptRent)
-- 요청: GET {endpoint}/getRTMSDataSvcAptRent?serviceKey&LAWD_CD(5자리)&DEAL_YMD(YYYYMM)&pageNo&numOfRows
-- 응답: XML. 금액은 '만원' 단위 문자열에 콤마 포함 ("100,000").
+- 문서: 공공데이터포털 "국토교통부_{아파트|연립다세대|오피스텔} 전월세 실거래가 자료" (docs/*.hwp)
+- 요청: GET {endpoint}/{operation}?serviceKey&LAWD_CD(5자리)&DEAL_YMD(YYYYMM)&pageNo&numOfRows
+- 응답: XML. 세 API의 골격은 같고 건물명 필드만 다르다. 금액은 '만원' 단위 문자열에 콤마 포함 ("100,000").
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
 import httpx
 import xmltodict
 
-FIXTURE_PATH = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "rent_response.xml"
+FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures"
+
+
+class HousingType(StrEnum):
+    APARTMENT = "apartment"
+    MULTI_HOUSE = "multi_house"  # 연립·다세대 (빌라)
+    OFFICETEL = "officetel"
+
+
+@dataclass(frozen=True)
+class HousingSpec:
+    operation: str  # API 오퍼레이션 이름
+    name_field: str  # 건물명 XML 필드
+    fixture: str  # Mock용 픽스처 파일명
+
+
+HOUSING_SPECS: dict[HousingType, HousingSpec] = {
+    HousingType.APARTMENT: HousingSpec("getRTMSDataSvcAptRent", "aptNm", "rent_response.xml"),
+    HousingType.MULTI_HOUSE: HousingSpec("getRTMSDataSvcRHRent", "mhouseNm", "rent_response_rh.xml"),
+    HousingType.OFFICETEL: HousingSpec("getRTMSDataSvcOffiRent", "offiNm", "rent_response_offi.xml"),
+}
 
 
 class MolitApiError(RuntimeError):
-    """API 오류(키 미등록, 쿼터 초과, HTTP 오류 등)."""
+    """API 오류(키 미등록, 서비스 없음, 쿼터 초과, HTTP 오류 등)."""
 
 
 @dataclass(frozen=True)
 class RentRecord:
-    apt_name: str
+    housing_type: HousingType
+    building_name: str
+    sub_type: str  # 연립·다세대만 "연립" | "다세대", 그 외 ""
     dong: str
     area_m2: float
     floor: int
@@ -1061,7 +1168,7 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
-def parse_rent_xml(xml_text: str) -> tuple[list[RentRecord], int]:
+def parse_rent_xml(xml_text: str, housing_type: HousingType) -> tuple[list[RentRecord], int]:
     """XML → (레코드 목록, totalCount). 공공데이터포털 공통 에러 포맷은 예외로 변환."""
     data = xmltodict.parse(xml_text)
     if "OpenAPI_ServiceResponse" in data:
@@ -1079,9 +1186,12 @@ def parse_rent_xml(xml_text: str) -> tuple[list[RentRecord], int]:
     if isinstance(items, dict):  # 결과가 1건이면 dict로 옴
         items = [items]
 
+    name_field = HOUSING_SPECS[housing_type].name_field
     records = [
         RentRecord(
-            apt_name=_clean(it.get("aptNm")),
+            housing_type=housing_type,
+            building_name=_clean(it.get(name_field)),
+            sub_type=_clean(it.get("houseType")),
             dong=_clean(it.get("umdNm")),
             area_m2=_to_float(it.get("excluUseAr")),
             floor=_to_int(it.get("floor")),
@@ -1098,16 +1208,33 @@ def parse_rent_xml(xml_text: str) -> tuple[list[RentRecord], int]:
 
 
 class RentClient(Protocol):
-    def fetch(self, lawd_cd: str, deal_ymd: str, num_of_rows: int = 1000) -> list[RentRecord]: ...
+    def fetch(
+        self,
+        lawd_cd: str,
+        deal_ymd: str,
+        housing_type: HousingType = HousingType.APARTMENT,
+        num_of_rows: int = 1000,
+    ) -> list[RentRecord]: ...
 
 
 class MolitRentClient:
-    def __init__(self, endpoint: str, service_key: str, http: httpx.Client | None = None) -> None:
-        self._endpoint = endpoint.rstrip("/")
+    def __init__(
+        self, endpoints: dict[HousingType, str], service_key: str, http: httpx.Client | None = None
+    ) -> None:
+        self._endpoints = {k: v.rstrip("/") for k, v in endpoints.items()}
         self._key = service_key  # 디코딩된 키. httpx가 params로 한 번만 인코딩한다.
         self._http = http or httpx.Client(timeout=15.0)
 
-    def fetch(self, lawd_cd: str, deal_ymd: str, num_of_rows: int = 1000) -> list[RentRecord]:
+    def fetch(
+        self,
+        lawd_cd: str,
+        deal_ymd: str,
+        housing_type: HousingType = HousingType.APARTMENT,
+        num_of_rows: int = 1000,
+    ) -> list[RentRecord]:
+        endpoint = self._endpoints.get(housing_type)
+        if not endpoint:
+            raise MolitApiError(f"{housing_type.value} 유형의 엔드포인트가 설정되지 않았습니다")
         params = {
             "serviceKey": self._key,
             "LAWD_CD": lawd_cd,
@@ -1116,46 +1243,55 @@ class MolitRentClient:
             "numOfRows": num_of_rows,
         }
         try:
-            resp = self._http.get(f"{self._endpoint}/getRTMSDataSvcAptRent", params=params)
+            resp = self._http.get(f"{endpoint}/{HOUSING_SPECS[housing_type].operation}", params=params)
             resp.raise_for_status()
         except httpx.HTTPError as e:
             raise MolitApiError(f"HTTP 오류: {e}") from e
-        records, _ = parse_rent_xml(resp.text)
+        records, _ = parse_rent_xml(resp.text, housing_type)
         return records
 
 
 class MockMolitRentClient:
-    """키 없이 개발/테스트용. 픽스처 XML을 그대로 반환한다."""
+    """키 없이 개발/테스트용. 유형별 픽스처 XML을 그대로 반환한다."""
 
-    def fetch(self, lawd_cd: str, deal_ymd: str, num_of_rows: int = 1000) -> list[RentRecord]:
-        records, _ = parse_rent_xml(FIXTURE_PATH.read_text(encoding="utf-8"))
+    def fetch(
+        self,
+        lawd_cd: str,
+        deal_ymd: str,
+        housing_type: HousingType = HousingType.APARTMENT,
+        num_of_rows: int = 1000,
+    ) -> list[RentRecord]:
+        xml_text = (FIXTURE_DIR / HOUSING_SPECS[housing_type].fixture).read_text(encoding="utf-8")
+        records, _ = parse_rent_xml(xml_text, housing_type)
         return records
 ```
 
 - [ ] **Step 5: 통과 확인**
 
 Run: `uv run pytest tests/tools/test_molit_rent.py -v`
-Expected: 7 passed
+Expected: 13 passed (parametrize 3건 포함)
 
-- [ ] **Step 6: 실제 API 스모크 (수동, 1회)**
+- [ ] **Step 6: 실제 API 스모크 (수동, 세 유형 각 1회)**
 
 Run:
 ```bash
 uv run python -c "
 from rent_agent.config import get_settings
-from rent_agent.tools.molit_rent import MolitRentClient
+from rent_agent.tools.molit_rent import HousingType, MolitRentClient
 s = get_settings()
-c = MolitRentClient(s.apartment_openapi_endpoint, s.apartment_openapi_key_decoded)
-r = c.fetch('11680', '202607', num_of_rows=3)
-print(len(r), r[0])"
+eps = {HousingType.APARTMENT: s.apartment_openapi_endpoint, HousingType.MULTI_HOUSE: s.multi_house_openapi_endpoint, HousingType.OFFICETEL: s.office_openapi_endpoint}
+c = MolitRentClient(eps, s.apartment_openapi_key_decoded)
+for t in HousingType:
+    r = c.fetch('11680', '202607', housing_type=t, num_of_rows=2)
+    print(t.value, len(r), r[0].building_name, r[0].deposit)"
 ```
-Expected: `3 RentRecord(apt_name='...', ...)` 출력. `MolitApiError`가 나면 `.env` 키 확인.
+Expected: 세 줄 출력(`apartment 2 ...`, `multi_house 2 ...`, `officetel 2 ...`). `MolitApiError`가 나면 `.env`의 키/엔드포인트 확인.
 
 - [ ] **Step 7: 커밋**
 
 ```bash
 git add src/rent_agent/tools/molit_rent.py tests/tools/test_molit_rent.py tests/fixtures
-git commit -m "feat: 국토부 아파트 전월세 실거래가 클라이언트 및 XML 파서
+git commit -m "feat: 국토부 전월세 실거래가 클라이언트 (아파트·연립다세대·오피스텔) 및 XML 파서
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1175,12 +1311,14 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 from datetime import date
 
 from rent_agent.tools.market_stats import JeonseMarketSummary, summarize_jeonse
-from rent_agent.tools.molit_rent import RentRecord
+from rent_agent.tools.molit_rent import HousingType, RentRecord
 
 
 def rec(apt="까치마을", area=39.6, deposit=40000, rent=0, day=1) -> RentRecord:
     return RentRecord(
-        apt_name=apt,
+        housing_type=HousingType.APARTMENT,
+        building_name=apt,
+        sub_type="",
         dong="수서동",
         area_m2=area,
         floor=5,
@@ -1202,21 +1340,21 @@ def test_filters_pure_jeonse_and_apt_and_area():
         rec(apt="다른단지", deposit=99999),  # 단지 다름 → 제외
         rec(area=59.9, deposit=70000),  # 면적 차이 > 허용치 → 제외
     ]
-    s = summarize_jeonse(records, apt_name="까치마을", area_m2=39.6, area_tolerance=5.0)
+    s = summarize_jeonse(records, building_name="까치마을", area_m2=39.6, area_tolerance=5.0)
     assert s.count == 3
     assert s.median_deposit == 45000
     assert s.min_deposit == 40000 and s.max_deposit == 50000
     assert [r.deposit for r in s.recent] == [50000, 45000, 40000]  # 최신순
 
 
-def test_apt_name_partial_match_and_no_area_filter():
+def test_building_name_partial_match_and_no_area_filter():
     records = [rec(apt="까치마을1단지"), rec(apt="까치마을2단지", area=59.9)]
-    s = summarize_jeonse(records, apt_name="까치마을")
+    s = summarize_jeonse(records, building_name="까치마을")
     assert s.count == 2
 
 
 def test_empty_summary():
-    s = summarize_jeonse([], apt_name="없는단지")
+    s = summarize_jeonse([], building_name="없는단지")
     assert s == JeonseMarketSummary(count=0, median_deposit=None, min_deposit=None, max_deposit=None, recent=[])
 
 
@@ -1261,16 +1399,16 @@ class JeonseMarketSummary:
 
 def summarize_jeonse(
     records: list[RentRecord],
-    apt_name: str | None = None,
+    building_name: str | None = None,
     area_m2: float | None = None,
     area_tolerance: float = 5.0,
 ) -> JeonseMarketSummary:
-    """순수 전세(월세 0)만 대상으로 단지명 부분일치·전용면적 ±허용치로 필터 후 요약."""
+    """순수 전세(월세 0)만 대상으로 건물명 부분일치·전용면적 ±허용치로 필터 후 요약. 주거 유형은 호출자가 이미 분리해 넘긴다."""
     filtered = [
         r
         for r in records
         if r.is_jeonse
-        and (apt_name is None or apt_name in r.apt_name)
+        and (building_name is None or building_name in r.building_name)
         and (area_m2 is None or abs(r.area_m2 - area_m2) <= area_tolerance)
     ]
     if not filtered:
@@ -1296,7 +1434,7 @@ Expected: 모두 passed
 
 ```bash
 git add src/rent_agent/tools/market_stats.py tests/tools/test_market_stats.py
-git commit -m "feat: 동일 단지·면적 전세 시세 요약 통계
+git commit -m "feat: 동일 건물·면적 전세 시세 요약 통계
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1668,10 +1806,11 @@ KNOWLEDGE_PROMPT = """당신은 부동산 임대차 법령·제도 전문 상담
 - 사회초년생이 이해할 수 있게 용어를 풀어 설명하고, 실무적으로 무엇을 해야 하는지 한 줄로 정리합니다.
 한국어로 답합니다."""
 
-MARKET_PROMPT = """당신은 아파트 전세 실거래가 조회 담당자입니다.
+MARKET_PROMPT = """당신은 전세 실거래가 조회 담당자입니다. 국토부 실거래가는 주거 유형별로 조회합니다.
 1. 사용자가 말한 지역명으로 find_region_code 를 호출해 시군구 코드를 찾습니다. 후보가 여럿이면 가장 구체적으로 일치하는 것을 고르고, 판단이 어려우면 후보를 나열해 되묻습니다.
-2. get_recent_jeonse_deals 를 호출해 최근 거래를 요약합니다.
-3. 결과는 거래 건수, 보증금 중위값/최소/최대, 최근 거래 5건, 데이터 한계(아파트만 해당, 단지명 표기 차이 가능)를 포함해 간결히 보고합니다.
+2. 주거 유형을 정합니다: 아파트 → apartment, 빌라·연립·다세대 → multi_house, 오피스텔 → officetel. 언급이 없으면 apartment로 조회하고 그 가정을 명시합니다.
+3. get_recent_jeonse_deals 를 호출해 최근 거래를 요약합니다.
+4. 결과는 주거 유형, 거래 건수, 보증금 중위값/최소/최대, 최근 거래 5건, 데이터 한계(건물명 표기 차이 가능, 신축·비등록 건물 누락 가능)를 포함해 간결히 보고합니다.
 숫자 단위는 '만원'입니다. 추측으로 시세를 만들지 않습니다. 한국어로 답합니다."""
 
 RISK_PROMPT = """당신은 전세 위험 판단 담당자입니다.
@@ -1844,7 +1983,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `src/rent_agent/agents/market_agent.py`
 - Test: `tests/agents/test_market_tool.py`
 
-도구는 클라이언트를 주입받아야 테스트 가능하므로 **팩토리 함수 안에서 `@tool`을 만든다**(클로저).
+도구는 클라이언트를 주입받아야 테스트 가능하므로 **팩토리 함수 안에서 `@tool`을 만든다**(클로저). 주거 유형은 문자열 인자로 받아 `HousingType`으로 검증한다.
 
 - [ ] **Step 1: 실패 테스트**
 
@@ -1868,21 +2007,37 @@ def test_find_region_code_tool():
     assert out == [{"name": "서울특별시 강남구", "code": "11680"}]
 
 
-def test_get_recent_jeonse_deals_tool_with_mock():
+def test_get_recent_jeonse_deals_apartment_default():
     _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
     out = json.loads(
-        get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "apt_name": "까치마을", "area_m2": 39.6, "months": 1})
+        get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "building_name": "까치마을", "area_m2": 39.6, "months": 1})
     )
+    assert out["housing_type"] == "apartment"
     assert out["count"] == 1  # 픽스처: 까치마을 39.6㎡ 순수 전세 1건 (45,000)
     assert out["median_deposit"] == 45000
-    assert out["recent"][0]["apt_name"] == "까치마을"
+    assert out["recent"][0]["building_name"] == "까치마을"
     assert out["recent"][0]["deal_date"] == "2026-07-10"
 
 
-def test_get_recent_jeonse_deals_no_match():
+def test_get_recent_jeonse_deals_multi_house():
     _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
-    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "apt_name": "없는단지"}))
+    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "housing_type": "multi_house", "months": 1}))
+    assert out["housing_type"] == "multi_house"
+    assert out["count"] == 2  # RH 픽스처 순수 전세 52,500 / 50,000
+    assert out["median_deposit"] == 51250
+    assert out["recent"][0]["sub_type"] in ("연립", "다세대")
+
+
+def test_get_recent_jeonse_deals_officetel_no_jeonse():
+    _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
+    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "housing_type": "officetel", "months": 1}))
     assert out["count"] == 0 and "message" in out
+
+
+def test_get_recent_jeonse_deals_invalid_housing_type():
+    _, get_recent_jeonse_deals = make_market_tools(MockMolitRentClient())
+    out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "housing_type": "villa"}))
+    assert "error" in out and "multi_house" in out["error"]
 ```
 
 - [ ] **Step 2: 실패 확인**
@@ -1894,7 +2049,7 @@ Expected: FAIL — ModuleNotFoundError
 
 `src/rent_agent/agents/market_agent.py`:
 ```python
-"""시세 조회 에이전트: 법정동코드 조회 + 실거래가 API + 통계 요약."""
+"""시세 조회 에이전트: 법정동코드 조회 + 실거래가 API(아파트/연립다세대/오피스텔) + 통계 요약."""
 
 import json
 from dataclasses import asdict
@@ -1909,6 +2064,7 @@ from rent_agent.config import Settings
 from rent_agent.tools.lawd_code import find_lawd_codes
 from rent_agent.tools.market_stats import summarize_jeonse
 from rent_agent.tools.molit_rent import (
+    HousingType,
     MockMolitRentClient,
     MolitApiError,
     MolitRentClient,
@@ -1940,34 +2096,48 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
 
     @tool
     def get_recent_jeonse_deals(
-        lawd_cd: str, apt_name: str | None = None, area_m2: float | None = None, months: int = 3
+        lawd_cd: str,
+        housing_type: str = "apartment",
+        building_name: str | None = None,
+        area_m2: float | None = None,
+        months: int = 3,
     ) -> str:
-        """국토부 아파트 전월세 실거래가에서 최근 N개월 순수 전세(월세 0) 거래를 조회해 요약한다.
-        lawd_cd: find_region_code로 얻은 5자리 코드. apt_name: 단지명 일부(선택). area_m2: 전용면적 ㎡(선택, ±5㎡).
-        반환 JSON: count, median_deposit, min_deposit, max_deposit(만원), recent(최근 5건), months_queried."""
+        """국토부 전월세 실거래가에서 최근 N개월 순수 전세(월세 0) 거래를 조회해 요약한다.
+        lawd_cd: find_region_code로 얻은 5자리 코드.
+        housing_type: apartment(아파트) | multi_house(연립·다세대·빌라) | officetel(오피스텔).
+        building_name: 건물/단지명 일부(선택). area_m2: 전용면적 ㎡(선택, ±5㎡).
+        반환 JSON: housing_type, count, median_deposit, min_deposit, max_deposit(만원), recent(최근 5건), months_queried."""
+        try:
+            htype = HousingType(housing_type)
+        except ValueError:
+            valid = ", ".join(t.value for t in HousingType)
+            return json.dumps({"error": f"housing_type은 다음 중 하나여야 합니다: {valid}"}, ensure_ascii=False)
+
         records = []
         errors: list[str] = []
         ymds = recent_deal_months(months=months)
         for ymd in ymds:
             try:
-                records.extend(client.fetch(lawd_cd, ymd))
+                records.extend(client.fetch(lawd_cd, ymd, housing_type=htype))
             except MolitApiError as e:
                 errors.append(f"{ymd}: {e}")
-        summary = summarize_jeonse(records, apt_name=apt_name, area_m2=area_m2)
+        summary = summarize_jeonse(records, building_name=building_name, area_m2=area_m2)
         payload: dict = {
+            "housing_type": htype.value,
             "count": summary.count,
             "median_deposit": summary.median_deposit,
             "min_deposit": summary.min_deposit,
             "max_deposit": summary.max_deposit,
             "recent": [
-                {**asdict(r), "deal_date": r.deal_date.isoformat()} for r in summary.recent
+                {**asdict(r), "housing_type": r.housing_type.value, "deal_date": r.deal_date.isoformat()}
+                for r in summary.recent
             ],
             "months_queried": ymds,
         }
         if errors:
             payload["errors"] = errors
         if summary.count == 0:
-            payload["message"] = "조건에 맞는 순수 전세 거래가 없습니다. 단지명 표기나 면적, 조회 기간을 넓혀 보세요."
+            payload["message"] = "조건에 맞는 순수 전세 거래가 없습니다. 건물명 표기, 면적, 조회 기간, 주거 유형을 바꿔 보세요."
         return json.dumps(payload, ensure_ascii=False)
 
     return find_region_code, get_recent_jeonse_deals
@@ -1976,7 +2146,12 @@ def make_market_tools(client: RentClient) -> tuple[BaseTool, BaseTool]:
 def get_rent_client(settings: Settings) -> RentClient:
     if settings.molit_use_mock:
         return MockMolitRentClient()
-    return MolitRentClient(settings.apartment_openapi_endpoint, settings.apartment_openapi_key_decoded)
+    endpoints = {
+        HousingType.APARTMENT: settings.apartment_openapi_endpoint,
+        HousingType.MULTI_HOUSE: settings.multi_house_openapi_endpoint,
+        HousingType.OFFICETEL: settings.office_openapi_endpoint,
+    }
+    return MolitRentClient(endpoints, settings.apartment_openapi_key_decoded)
 
 
 def build_market_agent(settings: Settings, client: RentClient | None = None):
@@ -1993,7 +2168,7 @@ Expected: 모두 passed
 
 ```bash
 git add src/rent_agent/agents/market_agent.py tests/agents/test_market_tool.py
-git commit -m "feat: 실거래가 기반 시세 조회 에이전트 및 도구
+git commit -m "feat: 실거래가 기반 시세 조회 에이전트 (아파트·연립다세대·오피스텔)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -2231,6 +2406,9 @@ from rent_agent.config import get_settings
 
 st.set_page_config(page_title="rent-agent · 전세 리스크 상담", page_icon="🏠", layout="wide")
 
+# UI 라벨 → market_agent 도구의 housing_type 값
+HOUSING_LABELS = {"아파트": "apartment", "연립·다세대(빌라)": "multi_house", "오피스텔": "officetel"}
+
 
 @st.cache_resource
 def _graph():
@@ -2280,9 +2458,10 @@ with tab_chat:
 
 with tab_diag:
     with st.form("diag"):
-        c1, c2, c3 = st.columns(3)
+        c0, c1, c2, c3 = st.columns(4)
+        housing_label = c0.selectbox("주거 유형", list(HOUSING_LABELS))
         region_text = c1.text_input("지역 (구/시)", "강남구")
-        apt = c2.text_input("단지명", "")
+        apt = c2.text_input("건물/단지명", "")
         area = c3.number_input("전용면적 (㎡)", min_value=0.0, value=0.0, step=0.1)
         c4, c5, c6 = st.columns(3)
         deposit = c4.number_input("전세 보증금 (만원)", min_value=0, value=30000, step=500)
@@ -2299,12 +2478,15 @@ with tab_diag:
         if deposit == 0 or price == 0:
             st.error("보증금과 매매 시세는 필수입니다.")
         else:
-            parts = [f"{region_text} {apt} {f'{area}㎡' if area else ''} 전세 계약을 검토 중입니다."]
+            parts = [
+                f"{region_text} {apt} {f'{area}㎡' if area else ''} {housing_label} 전세 계약을 검토 중입니다. "
+                f"주거 유형 코드는 {HOUSING_LABELS[housing_label]}입니다."
+            ]
             parts.append(f"보증금 {deposit}만원, 매매 시세 {price}만원, 선순위 근저당 채권최고액 {liens}만원, "
                          f"선순위 임차보증금 {senior_dep}만원, 자기자금 {capital}만원, "
                          f"{'연소득 ' + str(income) + '만원, ' if income else ''}예상 금리 {rate}%.")
             if apt:
-                parts.append("같은 단지 최근 전세 시세와도 비교해 주세요.")
+                parts.append("같은 건물(단지)의 최근 전세 시세와도 비교해 주세요.")
             parts.append("이 계약이 적절한지 판단하고 리포트를 작성해 주세요.")
             with st.spinner("시세 조회 · 위험 계산 · 리포트 작성 중..."):
                 result = _run(" ".join(parts))
@@ -2318,8 +2500,9 @@ with tab_diag:
 Run: `uv run streamlit run src/rent_agent/app/streamlit_app.py`
 확인 항목:
 1. 지식 Q&A 탭에서 "계약갱신요구권은 몇 번 쓸 수 있나요?" → 근거 출처 포함 답변, 실행 흐름에 `knowledge_agent`.
-2. 전세 진단 탭 기본값 + 단지명 "까치마을", 면적 39.6 → "## 종합 판정" 리포트, 시세 비교 문단 포함, 실행 흐름에 `market_agent`·`risk_agent`·`report_agent`.
-3. LangSmith 대시보드에 트레이스 확인.
+2. 전세 진단 탭 기본값 + 주거 유형 "아파트", 단지명 "까치마을", 면적 39.6 → "## 종합 판정" 리포트, 시세 비교 문단 포함, 실행 흐름에 `market_agent`·`risk_agent`·`report_agent`.
+3. 주거 유형 "연립·다세대(빌라)", 지역 "강남구", 건물명 비움 → 시세 조회가 multi_house로 수행되는지 실행 흐름/리포트에서 확인.
+4. LangSmith 대시보드에 트레이스 확인.
 
 - [ ] **Step 3: 커밋**
 
@@ -2523,7 +2706,7 @@ Expected: 포맷 적용, 린트 통과, 유닛 테스트 전부 passed (integrat
 - "설계 결정" 섹션: ADR 6건 링크 + 각 한 줄 요약
 - "RAG 평가 결과" 섹션: `eval/results/<날짜>.md` 요약 표 복사
 - "에이전트 동작 예시" 섹션: 진단 질문 1개 → 실행 흐름(에이전트 순서) + 리포트 일부 캡처(텍스트)
-- "한계와 다음 단계": 매매·월세 확장, 등기부등본 파싱, 전국 법정동코드, 매매 실거래가 API로 시세 자동화, 낙찰가율 지역별 데이터화
+- "한계와 다음 단계": 매매·월세 확장, 등기부등본 파싱, 전국 법정동코드, 매매 실거래가 API로 시세 자동화, 낙찰가율 지역별 데이터화, 단독·다가구 전월세 API 추가(현재 아파트·연립다세대·오피스텔)
 
 - [ ] **Step 3: 커밋 & 푸시 & CI 확인**
 
@@ -2542,5 +2725,5 @@ Expected: 워크플로 성공. `gh run list --limit 1` 상태 `completed success
 ## 3. Self-Review 체크
 
 - **범위 커버리지:** 지식 QA(RAG) → Task 7·8·12 / 전세 판단 → Task 3·10 / 시세(실거래가) → Task 4·5·6·11 / 멀티에이전트 → Task 12 / Streamlit → Task 13 / LangSmith → `.env` + Task 12 확인 단계 / RAGAS → Task 14 / pytest → 전 Task / GitHub 연동+CI → Task 1·16 / 결정 근거 → Task 15 ADR + 각 파일 docstring.
-- **타입 일관성:** `RentRecord` 필드(apt_name, dong, area_m2, floor, build_year, deal_date, deposit, monthly_rent, contract_type, renewal_right_used)가 Task 5·6·11에서 동일. `JeonseInput`/`RiskAssessment` 필드가 Task 3·10에서 동일. `build_vectorstore(raw_dir, chroma_dir, embedding, collection, reset)` 시그니처가 Task 8·12에서 동일. `Region` 값(seoul/metro_over/metro_city/other)이 Task 3·9 프롬프트·10에서 동일. 소액임차인 수치가 Task 3 코드·Task 7 문서·Task 14 데이터셋에서 동일(16,500/5,500).
-- **알려진 주의점:** (1) `gpt-4.1-mini` 모델명이 계정에서 불가하면 `.env`의 `OPENAI_MODEL`만 바꾼다. (2) 실거래가 API는 아파트만 다룬다(오피스텔·빌라 제외) — UI 캡션과 MARKET_PROMPT에 명시됨. (3) 매매 시세는 사용자 입력이다. 매매 실거래가 API(RTMSDataSvcAptTrade)를 추가 신청하면 자동화 가능 — "다음 단계"에 기록.
+- **타입 일관성:** `RentRecord` 필드(housing_type, building_name, sub_type, dong, area_m2, floor, build_year, deal_date, deposit, monthly_rent, contract_type, renewal_right_used)가 Task 5·6·11에서 동일. `HousingType` 값(apartment/multi_house/officetel)이 Task 5·9 프롬프트·11·13에서 동일. `JeonseInput`/`RiskAssessment` 필드가 Task 3·10에서 동일. `build_vectorstore(raw_dir, chroma_dir, embedding, collection, reset)` 시그니처가 Task 8·12에서 동일. `Region` 값(seoul/metro_over/metro_city/other)이 Task 3·9 프롬프트·10에서 동일. 소액임차인 수치가 Task 3 코드·Task 7 문서·Task 14 데이터셋에서 동일(16,500/5,500).
+- **알려진 주의점:** (1) `gpt-4.1-mini` 모델명이 계정에서 불가하면 `.env`의 `OPENAI_MODEL`만 바꾼다. (2) 실거래가 API는 아파트·연립다세대·오피스텔 3종을 지원한다(단독·다가구 미지원) — MARKET_PROMPT와 README 한계에 명시. 연립다세대 서비스명은 `RTMSDataSvcRHRent`(공공데이터포털 표기 "연립다세대"), `.env`의 `MULTI_HOUSE_OPENAPI_ENDPOINT`가 이 값이어야 한다(2026-09-02 수정됨). (3) 매매 시세는 사용자 입력이다. 매매 실거래가 API(RTMSDataSvcAptTrade)를 추가 신청하면 자동화 가능 — "다음 단계"에 기록.
