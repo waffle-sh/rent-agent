@@ -3295,7 +3295,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `src/rent_agent/app/__init__.py`, `src/rent_agent/app/streamlit_app.py`, `.streamlit/config.toml`
 - Test: `tests/app/__init__.py`, `tests/app/test_streamlit_smoke.py` — `streamlit.testing.v1.AppTest`로 브라우저·LLM 없이 렌더링과 폼 제출을 검증(그래프를 가짜로 교체)
 
-**UI 설계 근거:** 그래프의 최종 답은 항상 `result["messages"][-1]`이다(정상 경로: supervisor 메시지, 원문 교체 포함 / 폴백 경로: report_agent 메시지). 에이전트 실행 흐름 expander는 포트폴리오에서 멀티에이전트 동작을 보여 주는 핵심 요소라 도구 호출·핸드오프를 순서대로 표시한다. `_graph()`는 `st.cache_resource`로 프로세스당 1회만 조립한다(에이전트 4개 + 임베딩 클라이언트 생성 비용).
+**UI 설계 근거 (Task 13 리뷰 반영):** 실행 흐름은 `supervisor._current_turn`으로 현재 턴만 표시(InMemorySaver 단일 스레드라 상태가 누적됨), 최종 답변 작성자와 원문 교체 여부(`forwarded_from`)를 흐름 끝에 표시해 결정적 후처리를 UI에서 보이게 한다. 진단 결과는 `session_state.last_diag`에 보관해 재실행에도 유지, 그래프 예외는 `st.error`로. 위젯은 key로 식별해 테스트가 배치 순서에 의존하지 않게 한다. 그래프의 최종 답은 항상 `result["messages"][-1]`이다(정상 경로: supervisor 메시지, 원문 교체 포함 / 폴백 경로: report_agent 메시지). 에이전트 실행 흐름 expander는 포트폴리오에서 멀티에이전트 동작을 보여 주는 핵심 요소라 도구 호출·핸드오프를 순서대로 표시한다. `_graph()`는 `st.cache_resource`로 프로세스당 1회만 조립한다(에이전트 4개 + 임베딩 클라이언트 생성 비용).
 
 - [ ] **Step 1: 구현**
 
@@ -3352,16 +3352,34 @@ def _run(prompt: str):
 
 
 def _trace(result) -> list[str]:
-    """에이전트 호출 순서를 사람이 읽는 형태로. 포트폴리오 데모용 관측 정보."""
+    """에이전트 호출 순서를 사람이 읽는 형태로. 포트폴리오 데모용 관측 정보.
+
+    체크포인터(InMemorySaver) + 단일 thread_id라 상태가 턴마다 누적된다.
+    그래프와 같은 기준(`_current_turn`: 마지막 HumanMessage 이후)으로 이번 턴만 보여 준다.
+    마지막 두 줄은 supervisor.py의 결정적 후처리(원문 보존)를 눈에 보이게 한다.
+    """
+    messages = result["messages"]
     lines: list[str] = []
-    for m in result["messages"]:
+    for m in supervisor._current_turn(messages):
         name = getattr(m, "name", None)
         if isinstance(m, AIMessage) and m.tool_calls:
             for tc in m.tool_calls:
                 lines.append(f"🧭 {name or 'supervisor'} → {tc['name']}")
         elif isinstance(m, ToolMessage) and name and not name.startswith("transfer_"):
             lines.append(f"🔧 {name} 결과 수신")
+    if messages:
+        last = messages[-1]
+        lines.append(f"📝 최종 답변 작성: {getattr(last, 'name', None) or 'supervisor'}")
+        forwarded = (getattr(last, "response_metadata", None) or {}).get("forwarded_from")
+        if forwarded:
+            lines.append(f"📎 {forwarded} 원문 그대로 전달 (supervisor 재작성 대체)")
     return lines
+
+
+def _render_trace(lines: list[str]) -> None:
+    # 두 칸 + 줄바꿈 = markdown hard break. st.write는 여러 줄을 한 문단으로 합쳐 버린다.
+    with st.expander("에이전트 실행 흐름"):
+        st.markdown("  \n".join(lines) or "(추적 정보 없음)")
 
 
 if "thread_id" not in st.session_state:
@@ -3383,58 +3401,81 @@ with tab_chat:
         st.session_state.chat.append(("user", q))
         st.chat_message("user").markdown(q)
         with st.chat_message("assistant"), st.spinner("에이전트가 답변을 준비 중..."):
-            result = _run(q)
-            answer = result["messages"][-1].content
-            st.markdown(answer)
-            with st.expander("에이전트 실행 흐름"):
-                st.write("\n".join(_trace(result)) or "(추적 정보 없음)")
-        st.session_state.chat.append(("assistant", answer))
+            try:
+                result = _run(q)
+            except Exception as exc:  # API 한도·네트워크 등. 사용자에게 트레이스백을 보이지 않는다.
+                st.error(f"에이전트 실행에 실패했습니다: {exc}")
+            else:
+                answer = result["messages"][-1].content
+                st.markdown(answer)
+                _render_trace(_trace(result))
+                st.session_state.chat.append(("assistant", answer))
 
 with tab_diag:
     with st.form("diag"):
         c0, c1, c2, c3 = st.columns(4)
-        housing_label = c0.selectbox("주거 유형", list(HOUSING_LABELS))
-        region_text = c1.text_input("지역 (구/시)", "강남구")
-        apt = c2.text_input("건물/단지명", "")
-        area = c3.number_input("전용면적 (㎡)", min_value=0.0, value=0.0, step=0.1)
+        housing_label = c0.selectbox("주거 유형", list(HOUSING_LABELS), key="housing")
+        region_text = c1.text_input("지역 (구/시)", "강남구", key="region")
+        apt = c2.text_input("건물/단지명", "", key="building")
+        area = c3.number_input("전용면적 (㎡)", min_value=0.0, value=0.0, step=0.1, key="area")
         c4, c5, c6 = st.columns(3)
-        deposit = c4.number_input("전세 보증금 (만원)", min_value=0, value=30000, step=500)
-        price = c5.number_input("매매 시세 (만원)", min_value=0, value=50000, step=500)
+        deposit = c4.number_input(
+            "전세 보증금 (만원)", min_value=0, value=30000, step=500, key="deposit"
+        )
+        price = c5.number_input(
+            "매매 시세 (만원)", min_value=0, value=50000, step=500, key="price"
+        )
         liens = c6.number_input(
-            "선순위 근저당 채권최고액 (만원)", min_value=0, value=0, step=500
+            "선순위 근저당 채권최고액 (만원)", min_value=0, value=0, step=500, key="liens"
         )
         c7, c8, c9 = st.columns(3)
         senior_dep = c7.number_input(
-            "선순위 임차보증금 (만원, 다가구)", min_value=0, value=0, step=500
+            "선순위 임차보증금 (만원, 다가구)", min_value=0, value=0, step=500, key="senior_dep"
         )
-        capital = c8.number_input("자기자금 (만원)", min_value=0, value=0, step=500)
-        income = c9.number_input("연소득 (만원, 선택)", min_value=0, value=0, step=100)
-        rate = st.slider("전세대출 예상 금리 (%)", 0.0, 10.0, 3.5, 0.1)
+        capital = c8.number_input(
+            "자기자금 (만원)", min_value=0, value=0, step=500, key="capital"
+        )
+        income = c9.number_input(
+            "연소득 (만원, 선택)", min_value=0, value=0, step=100, key="income"
+        )
+        rate = st.slider("전세대출 예상 금리 (%)", 0.0, 10.0, 3.5, 0.1, key="rate")
         submitted = st.form_submit_button("진단하기", type="primary")
 
     if submitted:
         if deposit == 0 or price == 0:
             st.error("보증금과 매매 시세는 필수입니다.")
         else:
+            # filter(None, ...): 단지명·면적이 비면 빈 조각을 버려 이중 공백을 만들지 않는다.
+            subject = " ".join(
+                filter(None, [region_text, apt, f"{area}㎡" if area else "", housing_label])
+            )
             parts = [
-                f"{region_text} {apt} {f'{area}㎡' if area else ''} {housing_label} "
-                f"전세 계약을 검토 중입니다. "
-                f"주거 유형 코드는 {HOUSING_LABELS[housing_label]}입니다."
-            ]
-            parts.append(
+                f"{subject} 전세 계약을 검토 중입니다. "
+                f"주거 유형 코드는 {HOUSING_LABELS[housing_label]}입니다.",
                 f"보증금 {deposit}만원, 매매 시세 {price}만원, "
                 f"선순위 근저당 채권최고액 {liens}만원, "
                 f"선순위 임차보증금 {senior_dep}만원, 자기자금 {capital}만원, "
-                f"{'연소득 ' + str(income) + '만원, ' if income else ''}예상 금리 {rate}%."
-            )
-            if apt:
-                parts.append("같은 건물(단지)의 최근 전세 시세와도 비교해 주세요.")
-            parts.append("이 계약이 적절한지 판단하고 리포트를 작성해 주세요.")
+                f"{'연소득 ' + str(income) + '만원, ' if income else ''}예상 금리 {rate}%.",
+                "같은 건물(단지)의 최근 전세 시세와도 비교해 주세요." if apt else "",
+                "이 계약이 적절한지 판단하고 리포트를 작성해 주세요.",
+            ]
             with st.spinner("시세 조회 · 위험 계산 · 리포트 작성 중..."):
-                result = _run(" ".join(parts))
-            st.markdown(result["messages"][-1].content)
-            with st.expander("에이전트 실행 흐름"):
-                st.write("\n".join(_trace(result)) or "(추적 정보 없음)")
+                try:
+                    result = _run(" ".join(filter(None, parts)))
+                except Exception as exc:
+                    result = None
+                    st.error(f"에이전트 실행에 실패했습니다: {exc}")
+            if result is not None:
+                # 다른 위젯 조작으로 rerun이 나도 진단 결과가 사라지지 않게 세션에 남긴다.
+                st.session_state.last_diag = {
+                    "answer": result["messages"][-1].content,
+                    "trace": _trace(result),
+                }
+                st.markdown(st.session_state.last_diag["answer"])
+                _render_trace(st.session_state.last_diag["trace"])
+    elif "last_diag" in st.session_state:
+        st.markdown(st.session_state.last_diag["answer"])
+        _render_trace(st.session_state.last_diag["trace"])
 ```
 
 - [ ] **Step 2: 헤드리스 스모크 테스트 (LLM 없음)**
@@ -3462,35 +3503,57 @@ from streamlit.testing.v1 import AppTest
 APP = str(Path(__file__).resolve().parents[2] / "src" / "rent_agent" / "app" / "streamlit_app.py")
 
 
+def _risk_turn(prompt: str, **final_kwargs) -> list:
+    """한 턴: supervisor → risk_agent 핸드오프 + 위험 판단 도구 + 최종 답."""
+    return [
+        HumanMessage(prompt),
+        AIMessage(
+            "",
+            name="supervisor",
+            tool_calls=[{"name": "transfer_to_risk_agent", "args": {}, "id": "c1"}],
+        ),
+        ToolMessage("ok", tool_call_id="c1", name="transfer_to_risk_agent"),
+        AIMessage(
+            "",
+            name="risk_agent",
+            tool_calls=[{"name": "assess_jeonse_risk", "args": {}, "id": "c2"}],
+        ),
+        ToolMessage("{}", tool_call_id="c2", name="assess_jeonse_risk"),
+        AIMessage("## 종합 판정: 위험\n테스트 리포트", name="supervisor", **final_kwargs),
+    ]
+
+
+def _earlier_knowledge_turn() -> list:
+    """이전 턴(체크포인터에 누적된 히스토리). 실행 흐름에 나오면 안 된다."""
+    return [
+        HumanMessage("이전 질문"),
+        AIMessage(
+            "",
+            name="supervisor",
+            tool_calls=[{"name": "transfer_to_knowledge_agent", "args": {}, "id": "p1"}],
+        ),
+        ToolMessage("ok", tool_call_id="p1", name="transfer_to_knowledge_agent"),
+        AIMessage("이전 답", name="supervisor"),
+    ]
+
+
 class FakeGraph:
-    def __init__(self):
+    def __init__(self, history=None, error: Exception | None = None):
         self.calls: list[str] = []
+        # history: prompt를 받아 messages를 만드는 함수. 기본은 현재 턴만 담긴 위험 진단 흐름.
+        self._history = history or _risk_turn
+        self._error = error
 
     def invoke(self, inputs, config=None):
         prompt = inputs["messages"][0].content
         self.calls.append(prompt)
-        return {
-            "messages": [
-                HumanMessage(prompt),
-                AIMessage(
-                    "",
-                    name="supervisor",
-                    tool_calls=[{"name": "transfer_to_risk_agent", "args": {}, "id": "c1"}],
-                ),
-                ToolMessage("ok", tool_call_id="c1", name="transfer_to_risk_agent"),
-                AIMessage(
-                    "",
-                    name="risk_agent",
-                    tool_calls=[{"name": "assess_jeonse_risk", "args": {}, "id": "c2"}],
-                ),
-                ToolMessage("{}", tool_call_id="c2", name="assess_jeonse_risk"),
-                AIMessage("## 종합 판정: 위험\n테스트 리포트", name="supervisor"),
-            ]
-        }
+        if self._error is not None:
+            raise self._error
+        return {"messages": self._history(prompt)}
 
 
-def _app(monkeypatch) -> tuple[AppTest, FakeGraph]:
-    fake = FakeGraph()
+def _app(monkeypatch, fake: FakeGraph | None = None) -> tuple[AppTest, FakeGraph]:
+    fake = fake or FakeGraph()
     from rent_agent.agents import supervisor
 
     monkeypatch.setattr(supervisor, "build_graph", lambda *a, **kw: fake)
@@ -3500,44 +3563,89 @@ def _app(monkeypatch) -> tuple[AppTest, FakeGraph]:
     return at, fake
 
 
+def _trace_text(at: AppTest) -> str:
+    """expander의 repr에는 자식 텍스트가 없으므로 자식 markdown 값을 모아 본다."""
+    return "\n".join(m.value for e in at.expander for m in e.markdown)
+
+
+def _fill_valid_diag(at: AppTest) -> None:
+    at.selectbox(key="housing").select("연립·다세대(빌라)")
+    at.number_input(key="deposit").set_value(45000)
+    at.number_input(key="price").set_value(60000)
+
+
 def test_page_renders_two_tabs_and_form(monkeypatch):
     at, _ = _app(monkeypatch)
     at.run()
     assert not at.exception
     assert [t.label for t in at.tabs] == ["💬 지식 Q&A", "🔎 전세 진단"]
-    assert at.selectbox[0].options == ["아파트", "연립·다세대(빌라)", "오피스텔"]
+    assert at.selectbox(key="housing").options == ["아파트", "연립·다세대(빌라)", "오피스텔"]
     assert at.button[0].label == "진단하기"
 
 
 def test_diagnosis_form_builds_prompt_with_housing_type_and_shows_report(monkeypatch):
     at, fake = _app(monkeypatch)
     at.run()
-    at.selectbox[0].select("연립·다세대(빌라)")
-    at.number_input[1].set_value(45000)  # 보증금
-    at.number_input[2].set_value(60000)  # 매매 시세
+    _fill_valid_diag(at)
     at.button[0].click().run()
     assert not at.exception
     assert len(fake.calls) == 1
     prompt = fake.calls[0]
     assert "multi_house" in prompt and "45000만원" in prompt and "60000만원" in prompt
+    assert "  " not in prompt  # filter(None, ...) 덕분에 이중 공백이 없다
     assert any("## 종합 판정: 위험" in m.value for m in at.markdown)
-    # expander의 repr에는 자식 텍스트가 없으므로 자식 markdown 요소를 본다.
-    assert any(
-        "risk_agent → assess_jeonse_risk" in m.value for e in at.expander for m in e.markdown
-    )
+    assert "risk_agent → assess_jeonse_risk" in _trace_text(at)
 
 
 def test_diagnosis_form_requires_deposit_and_price(monkeypatch):
     at, fake = _app(monkeypatch)
     at.run()
-    at.number_input[1].set_value(0)
+    at.number_input(key="deposit").set_value(0)
     at.button[0].click().run()
     assert fake.calls == []
     assert at.error and "필수" in at.error[0].value
+
+
+def test_trace_shows_only_current_turn_and_forwarded_marker(monkeypatch):
+    def history(prompt: str) -> list:
+        return _earlier_knowledge_turn() + _risk_turn(
+            prompt, response_metadata={"forwarded_from": "report_agent"}
+        )
+
+    at, _ = _app(monkeypatch, FakeGraph(history=history))
+    at.run()
+    _fill_valid_diag(at)
+    at.button[0].click().run()
+    assert not at.exception
+    trace = _trace_text(at)
+    assert "risk_agent → assess_jeonse_risk" in trace
+    assert "📎 report_agent 원문 그대로 전달" in trace
+    # 이전 턴의 핸드오프는 이번 턴 흐름이 아니다.
+    assert "transfer_to_knowledge_agent" not in trace
+
+
+def test_diagnosis_result_persists_across_rerun(monkeypatch):
+    at, fake = _app(monkeypatch)
+    at.run()
+    _fill_valid_diag(at)
+    at.button[0].click().run()
+    at.run()  # 다른 위젯 조작 없이 rerun (submitted=False)
+    assert not at.exception
+    assert len(fake.calls) == 1  # 재실행이 그래프를 다시 호출하지 않는다
+    assert any("## 종합 판정: 위험" in m.value for m in at.markdown)
+
+
+def test_graph_error_is_shown_as_st_error(monkeypatch):
+    at, _ = _app(monkeypatch, FakeGraph(error=RuntimeError("quota")))
+    at.run()
+    _fill_valid_diag(at)
+    at.button[0].click().run()
+    assert not at.exception  # 트레이스백이 아니라 안내 메시지로 처리
+    assert "실패" in at.error[0].value and "quota" in at.error[0].value
 ```
 
 Run: `uv run pytest tests/app -v`
-Expected: 3 passed (약 50초 — 각 AppTest 실행이 langchain/chroma 스택을 임포트). 위젯 인덱스는 페이지 위젯 순서를 따른다 — 폼 배치를 바꾸면 인덱스도 맞춘다.
+Expected: 6 passed (약 60초 — 각 AppTest 실행이 langchain/chroma 스택을 임포트). 위젯 인덱스는 페이지 위젯 순서를 따른다 — 폼 배치를 바꾸면 인덱스도 맞춘다.
 
 **AppTest 실측 주의점 (2026-09-02):** ① `AppTest.from_file`은 스크립트를 `rent_agent.app.streamlit_app` 모듈이 아닌 독립 네임스페이스로 exec하므로 모듈 속성 패치가 통하지 않는다 → 앱은 `supervisor.build_graph(...)`를 모듈 속성으로 호출하고 테스트는 `rent_agent.agents.supervisor.build_graph`를 패치, `st.cache_resource.clear()`로 테스트 간 캐시 격리. ② 상대 경로는 테스트 파일 기준으로 풀리므로 절대 경로 사용. ③ `Expander`의 repr에는 자식 텍스트가 없으므로 `e.markdown`을 순회해 검사.
 
