@@ -32,6 +32,8 @@ from rent_agent.config import Settings
 SUPERVISOR_NAME = "supervisor"
 REPORT_AGENT = "report_agent"
 RISK_TOOL = "assess_jeonse_risk"
+# risk_agent 도구의 검증 실패 접두어 (risk_agent.py와 일치해야 함)
+TOOL_ERROR_PREFIX = "입력 오류"
 # 이 에이전트들의 답은 사용자에게 원문 그대로 가야 한다 (수치·근거 URL·면책 문구 보존)
 VERBATIM_AGENTS = (REPORT_AGENT, "knowledge_agent")
 
@@ -55,16 +57,24 @@ def _last_worker_answer(turn: list[BaseMessage], names: tuple[str, ...]) -> AIMe
 
 
 def needs_report(state: MessagesState) -> Literal["report", "preserve"]:
-    """이번 턴에 위험 판단 도구가 실행됐는데 report_agent의 답이 없으면 리포트 단계로 보낸다."""
+    """이번 턴에 위험 판단 도구가 **유효한 결과**를 냈는데 report_agent의 답이 없으면
+    리포트 단계로 보낸다.
+    도구가 "입력 오류"를 돌려준 경우(추출 실패 → supervisor가 되묻는 게 맞음)는
+    리포트를 강제하지 않는다."""
     turn = _current_turn(state["messages"])
-    ran_risk = any(isinstance(m, ToolMessage) and m.name == RISK_TOOL for m in turn)
+    ran_risk = any(
+        isinstance(m, ToolMessage)
+        and m.name == RISK_TOOL
+        and not str(m.content).startswith(TOOL_ERROR_PREFIX)
+        for m in turn
+    )
     has_report = _last_worker_answer(turn, (REPORT_AGENT,)) is not None
     return "report" if ran_risk and not has_report else "preserve"
 
 
 def make_report_node(report_agent) -> Callable[[MessagesState], dict]:
-    """report_agent를 단독 실행하고 결과 AIMessage에 이름을 붙인다
-    (supervisor 밖에서는 이름이 붙지 않음)."""
+    """report_agent를 단독 실행한다. create_agent(name=...)가 AIMessage.name을 붙이지만,
+    후처리 노드들이 이름에 의존하므로 방어적으로 한 번 더 보장한다."""
 
     def run_report(state: MessagesState) -> dict:
         before = len(state["messages"])
@@ -82,24 +92,45 @@ def make_report_node(report_agent) -> Callable[[MessagesState], dict]:
 def preserve_worker_answer(state: MessagesState) -> dict:
     """supervisor의 마지막 답이 워커(report/knowledge)의 최종 답을 재작성한 것이면
     원문으로 교체한다.
-    워커 답이 없거나(예: supervisor가 되묻는 경우) 이미 동일하면 아무것도 바꾸지 않는다."""
+
+    - 워커 답이 없거나(예: supervisor가 되묻는 경우) 이미 동일하면 아무것도 바꾸지 않는다.
+    - report_agent 답은 항상 원문 우선(종합 리포트가 곧 최종 답).
+    - knowledge_agent 답은 **이 턴에서 답한 워커가 그것 하나일 때만** 교체한다.
+      시세+지식처럼 여러 워커가 답한 턴에서는 supervisor의 종합이 정당하며,
+      지식 답만으로 덮으면 시세 결과가 사라진다.
+    """
     messages = state["messages"]
     if not messages:
         return {}
-    worker = _last_worker_answer(_current_turn(messages), VERBATIM_AGENTS)
+    turn = _current_turn(messages)
+    worker = _last_worker_answer(turn, VERBATIM_AGENTS)
     final = messages[-1]
     if worker is None or not isinstance(final, AIMessage) or final.name != SUPERVISOR_NAME:
         return {}
+    if worker.name != REPORT_AGENT:
+        answered = {
+            m.name
+            for m in turn
+            if isinstance(m, AIMessage)
+            and m.name != SUPERVISOR_NAME
+            and not m.tool_calls
+            and m.content
+        }
+        if len(answered) > 1:
+            return {}
     if str(final.content).strip() == str(worker.content).strip():
         return {}
-    # 같은 id로 돌려주면 add_messages 리듀서가 기존 메시지를 교체한다
+    # 같은 id로 돌려주면 add_messages 리듀서가 기존 메시지를 교체한다. usage_metadata 등은 유지.
     return {
         "messages": [
-            AIMessage(
-                id=final.id,
-                content=worker.content,
-                name=SUPERVISOR_NAME,
-                response_metadata={"forwarded_from": worker.name},
+            final.model_copy(
+                update={
+                    "content": worker.content,
+                    "response_metadata": {
+                        **final.response_metadata,
+                        "forwarded_from": worker.name,
+                    },
+                }
             )
         ]
     }

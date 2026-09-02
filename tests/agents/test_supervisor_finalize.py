@@ -109,6 +109,44 @@ def test_needs_report_ignores_previous_turns():
     assert needs_report({"messages": msgs}) == "preserve"
 
 
+def test_no_report_forced_when_risk_tool_returned_input_error():
+    msgs = _risk_only_flow()
+    msgs[4] = ToolMessage(
+        "입력 오류: market_price: 0보다 커야 합니다.",
+        tool_call_id="c2",
+        name="assess_jeonse_risk",
+        id="t2",
+    )
+    msgs[-1] = AIMessage("매매 시세를 알려주시면 진단해 드릴게요.", name="supervisor", id="s2")
+    assert needs_report({"messages": msgs}) == "preserve"
+
+
+def test_knowledge_answer_not_forced_when_multiple_workers_answered():
+    msgs = [
+        HumanMessage("강남구 까치마을 시세랑 보증보험 조건 알려줘", id="h1"),
+        AIMessage("까치마을 신규 전세 중위값 4.8억, 3건.", name="market_agent", id="m1"),
+        AIMessage("HUG 보증은 전세가율 90% 이하.\n근거: HUG", name="knowledge_agent", id="k1"),
+        AIMessage(
+            "시세는 4.8억(신규 3건)이고, HUG 보증은 전세가율 90% 이하여야 합니다.\n근거: HUG",
+            name="supervisor",
+            id="s1",
+        ),
+    ]
+    assert preserve_worker_answer({"messages": msgs}) == {}
+
+
+def test_replacement_keeps_supervisor_metadata():
+    msgs = _flow("요약")
+    msgs[-1] = AIMessage(
+        "요약",
+        name="supervisor",
+        id="s2",
+        usage_metadata={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+    )
+    [rep] = preserve_worker_answer({"messages": msgs})["messages"]
+    assert rep.usage_metadata["total_tokens"] == 12 and rep.content == REPORT
+
+
 def test_knowledge_answer_is_also_preserved():
     msgs = [
         HumanMessage("대항력은 언제 생기나요", id="h1"),
