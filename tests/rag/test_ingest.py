@@ -56,7 +56,10 @@ def test_real_corpus_chunking_is_stable():
     chunks = split_documents(load_markdown_docs(REAL_RAW))
     assert 40 <= len(chunks) <= 70
     assert not any(c.metadata["section"].startswith("출처") for c in chunks)
-    assert all(len(c.page_content) <= 900 for c in chunks)
+    assert all(len(c.page_content) <= 1000 + 40 for c in chunks)  # 청크 + "[제목] " 접두
+    # 섹션 = 청크: 실제 문서의 어떤 ## 섹션도 둘로 갈리지 않아야 한다 (RAGAS Q9 회귀 방지)
+    keys = [(c.metadata["file"], c.metadata["section"]) for c in chunks]
+    assert len(keys) == len(set(keys)), [k for k in keys if keys.count(k) > 1]
 
 
 def test_build_vectorstore_persists_and_searches(tmp_path: Path):
@@ -67,7 +70,7 @@ def test_build_vectorstore_persists_and_searches(tmp_path: Path):
         raw_dir=raw, chroma_dir=chroma_dir, embedding=emb, collection="test_col", reset=True
     )
     n = vs._collection.count()
-    assert n >= 4
+    assert n >= 3  # 서문 + 2개 ## 섹션 (섹션 = 청크)
     # 디스크에서 다시 열어도 같은 개수 → 실제로 persist 됨
     reopened = Chroma(
         collection_name="test_col", embedding_function=emb, persist_directory=str(chroma_dir)

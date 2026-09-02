@@ -23,8 +23,14 @@ EXCLUDED_SECTION_PREFIXES = ("출처",)
 FALLBACK_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
 
 
+# 섹션 = 청크 원칙: 가장 긴 섹션(≈950자)이 잘리지 않도록 1000. 800이면 734자+210자로
+# 갈라진 꼬리(실무 팁)가 본문보다 먼저 검색되어 정답 근거가 컨텍스트에서 빠지는 문제가
+# 실측됨 (RAGAS Q9, 2026-09-02).
+DEFAULT_CHUNK_SIZE = 1000
+
+
 def split_documents(
-    docs: list[Document], chunk_size: int = 800, chunk_overlap: int = 100
+    docs: list[Document], chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: int = 100
 ) -> list[Document]:
     header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=HEADERS, strip_headers=False)
     char_splitter = RecursiveCharacterTextSplitter(
