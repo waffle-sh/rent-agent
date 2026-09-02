@@ -21,7 +21,7 @@ category: policy
 
 **실무 팁**: 가입 가능 여부는 **계약 전에** HUG 콜센터(1566-9009)나 모바일HUG로 확인하라. 계약 후 거절되면 이미 낸 계약금을 돌려받기 위해 특약에 의존해야 한다.
 
-## 보증금액 한도
+## HUG 전세보증 보증금액 한도
 
 | 구분 | 전세보증금 한도 |
 |---|---|
@@ -44,6 +44,7 @@ HUG의 핵심 심사 기준이다.
 - **단독·다중·다가구주택**은 세대가 여러 개이므로 별도로 **부채비율 80% 이내** 기준을 적용한다.
   `부채비율 = (선순위채권 + 해당 주택의 임대차보증금 합계) ÷ 주택가격`. 다만 신청인보다 **후순위인 보증금은 제외**하고 계산한다.
 - **선순위채권이 주택가격의 60%를 초과**하면 가입이 거절된다.
+- **갱신 보증**에도 담보인정비율 90%가 적용된다. 종전 100%에서 90%로 인하된 것은 **2024.1.1.부터**이며, 같은 시점에 갱신보증 보험료도 인하되었다(HUG FAQ Q26).
 
 **실무 팁**: "전세가율 90%"는 매매가 대비가 아니라 **HUG가 인정하는 주택가격** 대비다. 빌라는 이 인정가격이 실제 매매가보다 훨씬 낮게 나오므로 체감상 훨씬 엄격하다.
 
@@ -122,12 +123,7 @@ HUG는 자체 기준으로 주택가격을 산정하며, 이 값이 전세가율
 ## 출처
 
 - HUG 「전세보증금반환보증 상품개요」: https://www.khug.or.kr/hug/web/ig/dr/igdr000001.jsp
-- HUG 「전세보증금반환보증 이용절차 및 제출서류」: https://www.khug.or.kr/hug/web/ig/dr/igdr000002.jsp
-- HUG 「전세보증금반환보증 자주하는 질문」: https://www.khug.or.kr/hug/web/ig/dr/igdr000003.jsp
-- 모바일HUG 「전세보증반환 가입신청 - 상품안내」: https://onestop.khug.or.kr/webView/webBiz/apply/goods001
-- HUG 「보증상품별 보증료율」: https://www.khug.or.kr/khugcms/board/skin/download.jsp?id=1036&fileId=6786
-- HUG 「특례반환보증(임차인형) 상품개요」: https://www.khug.or.kr/hug/web/ig/dr/igdr000007.jsp
+- HUG 「전세보증금반환보증 자주하는 질문」(갱신보증 담보인정비율 90% 적용 시점 Q26): https://www.khug.or.kr/hug/web/ig/dr/igdr000003.jsp
+- 모바일HUG 「전세보증반환 가입신청 - 상품안내」(보증금 한도·신청기한·보증료율): https://onestop.khug.or.kr/webView/webBiz/apply/goods001
 - 한국주택금융공사 「일반전세지킴보증」: https://www.hf.go.kr/ko/sub02/sub02_05_01.do
-- 한국주택금융공사 「전세보증금 반환 청구 절차」: https://www.hf.go.kr/ko/sub02/sub02_05_07.do
-- SGI서울보증 「전세금보장신용보험」: https://www.sgic.co.kr/biz/ccp/index.html?p=CCPPRD030101F01
-- 서울주거포털 「전세 보증금 반환보증」 / 「전세보증금 반환보증 보증료 지원」: https://housing.seoul.go.kr/site/main/content/sh01_060400 , https://housing.seoul.go.kr/site/main/content/sh01_061030
+- 서울주거포털 「전세보증금 반환보증 보증료 지원」: https://housing.seoul.go.kr/site/main/content/sh01_061030

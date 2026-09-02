@@ -77,7 +77,7 @@ category: law
 
 **실무 팁**: 갱신 요구는 반드시 **내용증명·문자 등 증거가 남는 방법**으로, 종료 2개월 전까지 하라. 구두 통보는 나중에 다툼이 된다.
 
-## 계약갱신 거절 사유와 실거주 거절 후 손해배상 (제6조의3 제1항·제5항)
+## 계약갱신 거절 사유와 실거주 거절 후 손해배상 (제6조의3 제5항·제6항)
 
 임대인이 갱신 요구를 거절할 수 있는 대표 사유는 다음과 같다.
 
@@ -134,7 +134,6 @@ category: law
 
 - 국가법령정보센터 「주택임대차보호법」: https://www.law.go.kr/법령/주택임대차보호법
 - 국가법령정보센터 「주택임대차보호법 시행령」: https://www.law.go.kr/법령/주택임대차보호법시행령
-- 주택임대차보호법 제3조의3(임차권등기명령), 제3조의7(임대인의 정보 제시 의무), 제6조·제6조의3 조문: https://casenote.kr/법령/주택임대차보호법/제3조의3 , https://casenote.kr/법령/주택임대차보호법/제3조의7 , https://casenote.kr/법령/주택임대차보호법/제6조의3
 - 찾기쉬운 생활법령정보 「주택임대차」: https://easylaw.go.kr/CSP/CnpClsMain.laf?popMenu=ov&csmSeq=629&ccfNo=5&cciNo=2&cnpClsNo=2
-- 기획재정부 「전세사기 피해 방지를 위한 개정 주택임대차보호법 시행」: https://whatsnew.moef.go.kr/mec/ots/dif/view.do?difSer=66004f47-3299-4611-a7b5-665b4577df58
+- 주택임대차보호법 제6조의3(계약갱신 요구 등) 조문: https://casenote.kr/법령/주택임대차보호법/제6조의3
 - 한국은행 기준금리 추이: https://www.bok.or.kr/portal/singl/baseRate/list.do?dataSeCd=01&menuNo=200643
