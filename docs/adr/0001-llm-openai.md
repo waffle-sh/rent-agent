@@ -22,9 +22,9 @@
 
 - **langchain 1급 지원**: `langchain-openai`는 langchain 본체와 같은 릴리스 주기로 관리되는 퍼스트파티 패키지다. `langgraph-supervisor`가 자동 생성하는 핸드오프 도구는 `bind_tools` 규약에 의존하므로, 규약이 가장 먼저 맞춰지는 통합을 쓰는 것이 라우팅 실패 위험을 줄인다.
 - **실측으로 확인된 tool calling 동작**: 2026-09-02 통합 테스트에서 supervisor가 워커로 위임하는 핸드오프 도구 호출 자체는 실패하지 않았다. 관측된 문제는 도구 호출 오류가 아니라 **모델의 판단**(report_agent 건너뛰기 2회 중 1회, 리포트 재작성 3회 중 1회)이었고, 이는 ADR-0003의 결정적 노드로 해결했다.
-- **한국어 RAG 품질 실측**: `text-embedding-3-small` + `gpt-4.1-mini` 조합으로 10문항 RAGAS 평가에서 **faithfulness 0.914 / context_precision 0.886**(2026-09-02 5차, [`eval/results/2026-09-02.md`](../../eval/results/2026-09-02.md)). 환각과 검색 정확도는 실무 수준이다.
+- **한국어 RAG 품질 실측**: `text-embedding-3-small` + `gpt-4.1-mini` 조합으로 10문항 RAGAS 평가에서 **faithfulness 0.961 / context_precision 0.851**(2026-09-03 6차(최종), [`eval/results/2026-09-03.md`](../../eval/results/2026-09-03.md)). 환각과 검색 정확도는 실무 수준이다. (5차까지의 F 0.914는 컨텍스트 산정 방식이 달라 6차와 비교할 수 없다 — ADR-0002 지표 표.)
 - **한국어에서의 임베딩 한계도 같이 확인**: 같은 평가의 `answer_relevancy`는 0.391에 머물렀다. 이는 답 품질이 아니라 지표 특성이다 — RAGAS는 답에서 역생성한 질문과 원 질문의 임베딩 코사인을 쓰는데, 한국어 + `text-embedding-3-small`에서는 정답이어도 0.2~0.7에 머물고 정직한 "자료에 없음" 답은 0점 처리된다. → 이 지표는 절대 임계값이 아니라 **실행 간 기준선**으로만 쓴다(ADR-0002 참고).
-- **비용**: `mini` 등급을 골라 평가 1회(10문항, RAGAS 판정자 호출 포함)가 수십 센트 수준에서 끝났다. 5차까지 반복 실험이 가능했던 것이 이 선택의 실질적 이득이다.
+- **비용**: `mini` 등급을 골라 평가 1회(10문항, RAGAS 판정자 호출 포함)가 수십 센트 수준에서 끝났다. 6차까지 반복 실험이 가능했던 것이 이 선택의 실질적 이득이다.
 
 ## 검토한 대안
 
@@ -40,5 +40,5 @@
 
 - **얻은 것**: 도구 호출 규약 리스크 최소화, 반복 평가가 가능한 비용, 재현성(`temperature=0`).
 - **잃은 것**: OpenAI API 키 의존 — 키 없이는 지식 QA·리포트가 동작하지 않는다. 위험 판단만은 순수 함수라 키 없이도 계산·테스트된다(ADR-0004).
-- **완화**: 모델명이 환경변수로 격리되어 있어 같은 OpenAI 호환 인터페이스 안에서는 코드 수정 없이 교체된다. 다른 벤더로 갈 때 손대야 하는 곳은 `agents/llm.py`와 `rag/ingest.py::get_embedding` 두 함수뿐이다.
+- **완화**: 모델명이 환경변수로 격리되어 있어 같은 OpenAI 호환 인터페이스 안에서는 코드 수정 없이 교체된다. 다른 벤더로 갈 때 손대야 하는 곳은 세 군데다 — `agents/llm.py::get_llm`(대화 모델), `rag/ingest.py::get_embedding`(임베딩), 그리고 [`scripts/eval_rag.py`](../../scripts/eval_rag.py)의 평가 판정자(`AsyncOpenAI` 클라이언트를 RAGAS `llm_factory`에 주입하는 부분 — OpenAI 클라이언트에 직접 의존한다).
 - **테스트 격리**: 유닛 테스트는 `DeterministicFakeEmbedding`을 주입해 OpenAI를 호출하지 않는다. 실제 LLM을 쓰는 테스트는 `@integration` 마커로 분리해 CI에서 제외한다([`pyproject.toml`](../../pyproject.toml)).

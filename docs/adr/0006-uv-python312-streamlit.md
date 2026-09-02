@@ -26,7 +26,7 @@ uv run streamlit run src/rent_agent/app/streamlit_app.py
 ### uv
 
 - **lock 재현성**: `uv.lock`이 전체 의존성 트리를 해석된 버전으로 고정한다. ADR-0005의 `langchain-community==0.3.31`처럼 미묘한 조합이 성립해야 하는 프로젝트에서, "내 머신에서는 됐다"를 없애는 것이 필수다.
-- **속도**: 의존성 트리가 크다(langchain 계열 5개 + langgraph 3개 + chromadb + ragas + streamlit). 재설치·재해석이 빨라야 실험 반복이 가능하다. RAGAS를 5회 돌리며 핀을 조정한 작업이 이 속도 위에서 이루어졌다.
+- **속도**: 의존성 트리가 크다(langchain 계열 6개 + langgraph 3개 + chromadb + ragas + streamlit). 재설치·재해석이 빨라야 실험 반복이 가능하다. RAGAS를 5회 돌리며 핀을 조정한 작업이 이 속도 위에서 이루어졌다.
 - **`uv run`이 실행 경로를 통일한다**: 가상환경 활성화 단계가 없어진다. README·CI·평가 스크립트가 모두 `uv run ...` 한 형태를 쓰므로 문서와 실제 실행이 어긋나지 않는다.
 - **표준 준수**: 별도 포맷이 아니라 PEP 621 `pyproject.toml`을 쓴다. uv를 버려도 `pip install -e .`로 돌아갈 수 있다.
 
@@ -53,6 +53,8 @@ uv run streamlit run src/rent_agent/app/streamlit_app.py
 | **Python 3.13** | 최신 성능 개선 | 일부 C 확장 사전 빌드 휠 미지원 — chromadb 등에서 소스 빌드/실패 위험. 이 프로젝트가 3.13에서 얻는 이득은 없다. |
 | **FastAPI + React** | 실서비스형 구조, 프런트 자유도 | 포트폴리오 범위 대비 과하다. 백엔드 라우트·CORS·상태 관리·빌드 파이프라인이 추가되지만 보여줄 핵심(에이전트 설계)은 하나도 늘지 않는다. |
 | **Gradio** | Streamlit과 유사한 장점, ML 데모 표준 | 멀티 위젯 폼(보증금·시세·근저당·지역·자산 등 9개 필드)의 레이아웃 제어가 Streamlit보다 불편하다. 채팅과 폼을 한 화면에 두는 요구에는 Streamlit이 맞다. |
+
+> 이 표에서 **Python 3.13의 C 확장 휠 미비, Poetry의 의존성 해석 속도, Gradio의 레이아웃 제어**는 벤치마크 없이 내린 판단이다 — 자체 측정은 하지 않았다(**미확인**). 실측 근거가 있는 것은 채택안(uv + 3.12 + Streamlit)이 실제로 동작한다는 사실과 그 위에서 수행한 RAGAS 6회 실행이다.
 
 ## 결과/트레이드오프
 

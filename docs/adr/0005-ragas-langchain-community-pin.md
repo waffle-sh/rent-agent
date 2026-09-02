@@ -45,7 +45,7 @@ ModuleNotFoundError: No module named 'langchain_community.chat_models.vertexai'
 judge = llm_factory(settings.openai_model, client=client, max_tokens=4096)
 ```
 
-이 값이 없으면 평가가 완주하지 못한다 — ADR-0002의 1→5차 지표 표는 이 설정 위에서 얻은 것이다.
+이 값이 없으면 평가가 완주하지 못한다 — ADR-0002의 1→6차 지표 표는 이 설정 위에서 얻은 것이다.
 
 ## 검토한 대안
 
@@ -58,7 +58,7 @@ judge = llm_factory(settings.openai_model, client=client, max_tokens=4096)
 
 ## 결과/트레이드오프
 
-- **얻은 것**: `uv sync` 한 번으로 운영과 평가가 모두 되는 단일 환경. RAGAS 5회 실행으로 청킹·k·프롬프트 개선을 실측 근거와 함께 진행할 수 있었다(ADR-0002).
+- **얻은 것**: `uv sync` 한 번으로 운영과 평가가 모두 되는 단일 환경. RAGAS 6회 실행으로 청킹·k·프롬프트·평가 컨텍스트 개선을 실측 근거와 함께 진행할 수 있었다(ADR-0002).
 - **잃은 것**: `langchain-community`가 구버전에 묶인다. 향후 community의 어떤 통합을 직접 쓰려 하면 이 핀이 걸림돌이 된다.
 - **위험 관리**: 프로젝트 코드가 community를 직접 import하지 않으므로 현재 위험은 사실상 0이다. 이 성질이 유지되는지는 `grep -r langchain_community src/`로 확인할 수 있다 — 히트가 생기는 순간 이 ADR을 재검토해야 한다.
 - **핀 해제**: ragas가 vertexai 하드 import를 제거한 버전을 내면 `pyproject.toml`의 `==0.3.31`을 풀고 `uv lock --upgrade`로 검증한다.

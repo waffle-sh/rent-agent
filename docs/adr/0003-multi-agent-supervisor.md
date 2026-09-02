@@ -34,7 +34,7 @@ START → team(supervisor + 4 워커) → [needs_report?] → report → preserv
 ### 역할 분리
 
 - **프롬프트 단순화**: 워커마다 자기 역할의 지시만 갖는다. 모든 시스템 프롬프트는 [`agents/prompts.py`](../../src/rent_agent/agents/prompts.py) 한 곳에 모아 diff로 프롬프트 변경 이력을 추적한다. RAGAS 2·3차 개선이 프롬프트 한 파일 수정으로 끝난 것이 이 구조의 이득이다(ADR-0002 지표 표).
-- **개별 테스트**: 워커의 도구는 각각 유닛 테스트된다(`tests/agents/test_risk_tool.py`, `test_market_tool.py`). 그래프 전체를 도는 테스트는 `@integration`으로 분리한다.
+- **개별 테스트**: 워커의 도구는 각각 유닛 테스트된다(`tests/agents/test_risk_tool.py`, `test_market_tool.py`). 아래 두 결정적 후처리 노드는 [`tests/agents/test_supervisor_finalize.py`](../../tests/agents/test_supervisor_finalize.py)의 **LLM 호출 없는 12개 테스트**로 직접 검증된다 — 메시지 리스트를 직접 만들어 `needs_report()`/`preserve_worker_answer()`를 호출하므로, 확률적 관측(2회 중 1회 등)에 의존하지 않고 회귀를 잡는다. 그래프 전체를 도는 테스트만 `@integration`으로 분리한다.
 - **트레이스 가독성**: LangSmith에서 "supervisor → risk_agent → report_agent" 흐름이 그대로 보인다. 단일 에이전트의 긴 도구 호출 열보다 디버깅이 쉽다.
 - **핸드오프 도구 자동 생성**: `create_supervisor`가 워커별 `transfer_to_*` 도구를 만들어 준다. 직접 라우팅 엣지를 쓰면 워커 추가마다 그래프를 수정해야 한다.
 
