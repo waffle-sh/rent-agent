@@ -2990,6 +2990,7 @@ from rent_agent.config import Settings
 SUPERVISOR_NAME = "supervisor"
 REPORT_AGENT = "report_agent"
 RISK_TOOL = "assess_jeonse_risk"
+TOOL_ERROR_PREFIX = "입력 오류"  # risk_agent 도구의 검증 실패 접두어 (risk_agent.py와 일치해야 함)
 # 이 에이전트들의 답은 사용자에게 원문 그대로 가야 한다 (수치·근거 URL·면책 문구 보존)
 VERBATIM_AGENTS = (REPORT_AGENT, "knowledge_agent")
 
@@ -3009,15 +3010,20 @@ def _last_worker_answer(turn: list[BaseMessage], names: tuple[str, ...]) -> AIMe
 
 
 def needs_report(state: MessagesState) -> Literal["report", "preserve"]:
-    """이번 턴에 위험 판단 도구가 실행됐는데 report_agent의 답이 없으면 리포트 단계로 보낸다."""
+    """이번 턴에 위험 판단 도구가 **유효한 결과**를 냈는데 report_agent의 답이 없으면 리포트 단계로 보낸다.
+    도구가 "입력 오류"를 돌려준 경우(추출 실패 → supervisor가 되묻는 게 맞음)는 리포트를 강제하지 않는다."""
     turn = _current_turn(state["messages"])
-    ran_risk = any(isinstance(m, ToolMessage) and m.name == RISK_TOOL for m in turn)
+    ran_risk = any(
+        isinstance(m, ToolMessage) and m.name == RISK_TOOL and not str(m.content).startswith(TOOL_ERROR_PREFIX)
+        for m in turn
+    )
     has_report = _last_worker_answer(turn, (REPORT_AGENT,)) is not None
     return "report" if ran_risk and not has_report else "preserve"
 
 
 def make_report_node(report_agent) -> Callable[[MessagesState], dict]:
-    """report_agent를 단독 실행하고 결과 AIMessage에 이름을 붙인다 (supervisor 밖에서는 이름이 붙지 않음)."""
+    """report_agent를 단독 실행한다. create_agent(name=...)가 AIMessage.name을 붙이지만,
+    후처리 노드들이 이름에 의존하므로 방어적으로 한 번 더 보장한다."""
 
     def run_report(state: MessagesState) -> dict:
         before = len(state["messages"])
@@ -3034,24 +3040,36 @@ def make_report_node(report_agent) -> Callable[[MessagesState], dict]:
 
 def preserve_worker_answer(state: MessagesState) -> dict:
     """supervisor의 마지막 답이 워커(report/knowledge)의 최종 답을 재작성한 것이면 원문으로 교체한다.
-    워커 답이 없거나(예: supervisor가 되묻는 경우) 이미 동일하면 아무것도 바꾸지 않는다."""
+
+    - 워커 답이 없거나(예: supervisor가 되묻는 경우) 이미 동일하면 아무것도 바꾸지 않는다.
+    - report_agent 답은 항상 원문 우선(종합 리포트가 곧 최종 답).
+    - knowledge_agent 답은 **이 턴에서 답한 워커가 그것 하나일 때만** 교체한다. 시세+지식처럼 여러 워커가
+      답한 턴에서는 supervisor의 종합이 정당하며, 지식 답만으로 덮으면 시세 결과가 사라진다.
+    """
     messages = state["messages"]
     if not messages:
         return {}
-    worker = _last_worker_answer(_current_turn(messages), VERBATIM_AGENTS)
+    turn = _current_turn(messages)
+    worker = _last_worker_answer(turn, VERBATIM_AGENTS)
     final = messages[-1]
     if worker is None or not isinstance(final, AIMessage) or final.name != SUPERVISOR_NAME:
         return {}
+    if worker.name != REPORT_AGENT:
+        answered = {
+            m.name for m in turn if isinstance(m, AIMessage) and m.name != SUPERVISOR_NAME and not m.tool_calls and m.content
+        }
+        if len(answered) > 1:
+            return {}
     if str(final.content).strip() == str(worker.content).strip():
         return {}
-    # 같은 id로 돌려주면 add_messages 리듀서가 기존 메시지를 교체한다
+    # 같은 id로 돌려주면 add_messages 리듀서가 기존 메시지를 교체한다. usage_metadata 등은 유지.
     return {
         "messages": [
-            AIMessage(
-                id=final.id,
-                content=worker.content,
-                name=SUPERVISOR_NAME,
-                response_metadata={"forwarded_from": worker.name},
+            final.model_copy(
+                update={
+                    "content": worker.content,
+                    "response_metadata": {**final.response_metadata, "forwarded_from": worker.name},
+                }
             )
         ]
     }
@@ -3160,6 +3178,30 @@ def test_needs_report_ignores_previous_turns():
     assert needs_report({"messages": msgs}) == "preserve"
 
 
+def test_no_report_forced_when_risk_tool_returned_input_error():
+    msgs = _risk_only_flow()
+    msgs[4] = ToolMessage("입력 오류: market_price: 0보다 커야 합니다.", tool_call_id="c2", name="assess_jeonse_risk", id="t2")
+    msgs[-1] = AIMessage("매매 시세를 알려주시면 진단해 드릴게요.", name="supervisor", id="s2")
+    assert needs_report({"messages": msgs}) == "preserve"
+
+
+def test_knowledge_answer_not_forced_when_multiple_workers_answered():
+    msgs = [
+        HumanMessage("강남구 까치마을 시세랑 보증보험 조건 알려줘", id="h1"),
+        AIMessage("까치마을 신규 전세 중위값 4.8억, 3건.", name="market_agent", id="m1"),
+        AIMessage("HUG 보증은 전세가율 90% 이하.\n근거: HUG", name="knowledge_agent", id="k1"),
+        AIMessage("시세는 4.8억(신규 3건)이고, HUG 보증은 전세가율 90% 이하여야 합니다.\n근거: HUG", name="supervisor", id="s1"),
+    ]
+    assert preserve_worker_answer({"messages": msgs}) == {}
+
+
+def test_replacement_keeps_supervisor_metadata():
+    msgs = _flow("요약")
+    msgs[-1] = AIMessage("요약", name="supervisor", id="s2", usage_metadata={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12})
+    [rep] = preserve_worker_answer({"messages": msgs})["messages"]
+    assert rep.usage_metadata["total_tokens"] == 12 and rep.content == REPORT
+
+
 def test_knowledge_answer_is_also_preserved():
     msgs = [
         HumanMessage("대항력은 언제 생기나요", id="h1"),
@@ -3171,7 +3213,7 @@ def test_knowledge_answer_is_also_preserved():
 ```
 
 Run: `uv run pytest tests/agents/test_supervisor_finalize.py -v`
-Expected: 9 passed
+Expected: 12 passed
 
 - [ ] **Step 4: 통합 테스트 (실제 OpenAI 호출, CI 제외)**
 
@@ -3225,7 +3267,7 @@ def test_jeonse_diagnosis_calls_risk_and_report(real_settings):
     called = _agents_called(result)
     assert {"risk_agent", "report_agent"} <= called
     final = result["messages"][-1].content
-    assert final.lstrip().startswith("## 종합 판정")  # forward_message로 리포트 원문이 그대로 전달됨
+    assert final.lstrip().startswith("## 종합 판정")  # preserve_worker_answer 후처리로 리포트 원문이 그대로 전달됨
     assert "위험" in final  # 전세가율 75%, 총 부담률 95% → 위험
     assert "법률·금융 자문이 아닙니다" in final
 ```
@@ -3523,7 +3565,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 - `0001-llm-openai.md`: 결정 OpenAI gpt-4.1-mini + text-embedding-3-small. 근거: langchain 생태계 1급 지원, tool calling 안정성, 한국어 품질, 비용(mini). 대안: Claude(문서 이해 강점, 비용 상승), Ollama(무료지만 한국어·속도·tool calling 신뢰도). 결과: 모델명은 `OPENAI_MODEL` 환경변수로 교체 가능하게 격리.
 - `0002-vector-store-chroma.md`: 결정 Chroma 로컬 persist. 근거: 수십~수백 청크 규모, 메타데이터 필터 지원, 서버 불필요. 대안: FAISS(메타데이터 약함), pgvector(운영형이지만 Docker 부담). 결과: 확장 시 `rag/retriever.py`만 교체. **검색 전략 결정도 함께 기록**: 헤더 우선 분할(서문+첫 조문 병합으로 대항력 질의 1위 상실 실측), `## 출처` 제외, MMR 대신 단순 유사도(비중복 코퍼스에서 MMR이 관련 청크를 밀어냄 — 4개 질의 실측 표 포함), 결정적 id 업서트.
-- `0003-multi-agent-supervisor.md`: 결정 `langgraph-supervisor` 패턴 + 4 워커. 근거: 역할 분리로 프롬프트 단순화·개별 테스트·트레이스 가독성, 핸드오프 도구 자동 생성. **위험 판단은 LLM이 아닌 순수 함수**로 두어 재현성·테스트 가능성 확보. `output_mode=full_history` 선택 이유(리포트 에이전트가 수치 원본을 봐야 함). **두 결정적 후처리 노드**: ① supervisor가 report_agent를 건너뛰고 직접 답하는 현상(2회 중 1회) → 위험 도구 실행 후 리포트가 없으면 그래프가 report_agent를 실행(ensure_report), ② supervisor가 리포트를 재작성해 헤더·면책 문구를 유실하는 현상(3회 중 1회)과 forward_message 도구 미호출을 실측 → 원문 교체(preserve_worker_answer). 대안: 프롬프트 강화·forward 도구 — 둘 다 확률적이라 배제. 대안: 단일 ReAct 에이전트(도구 많아지면 라우팅 품질 저하), Swarm(피어 핸드오프, 흐름 예측 어려움). 트레이드오프: 호출 수 증가로 지연·비용 상승.
+- `0003-multi-agent-supervisor.md`: 결정 `langgraph-supervisor` 패턴 + 4 워커. 근거: 역할 분리로 프롬프트 단순화·개별 테스트·트레이스 가독성, 핸드오프 도구 자동 생성. **위험 판단은 LLM이 아닌 순수 함수**로 두어 재현성·테스트 가능성 확보. `output_mode=full_history` 선택 이유(리포트 에이전트가 수치 원본을 봐야 함). **두 결정적 후처리 노드**: ① supervisor가 report_agent를 건너뛰고 직접 답하는 현상(2회 중 1회) → 위험 도구 실행 후 리포트가 없으면 그래프가 report_agent를 실행(ensure_report), ② supervisor가 리포트를 재작성해 헤더·면책 문구를 유실하는 현상(3회 중 1회)과 forward_message 도구 미호출을 실측 → 원문 교체(preserve_worker_answer). 대안: 프롬프트 강화·forward 도구 — 둘 다 확률적이라 배제. 외부 그래프 합성(컴파일된 supervisor를 서브그래프 노드로, 체크포인터는 외부 그래프에만; 내부 `remaining_steps`는 MessagesState에 노출되지 않음 확인). 의존성 리스크: langgraph-supervisor 0.0.31이 내부에서 deprecated `create_react_agent` 사용 → 외부 그래프 설계로 교체 가능성 확보. 대안: 단일 ReAct 에이전트(도구 많아지면 라우팅 품질 저하), Swarm(피어 핸드오프, 흐름 예측 어려움). 트레이드오프: 호출 수 증가로 지연·비용 상승.
 - `0004-jeonse-risk-rules.md`: Task 3의 기준표(전세가율 70/80/90, 부담률 80/90/100 — 전세가율 경계를 한 단계 보수적으로 올린 값, 낙찰가율 0.8 가정, 소액임차인 표, 주거비 30%)와 출처 URL, 경매 배당 순서 가정(최우선변제 → 선순위 → 내 보증금, 최우선변제는 낙찰가의 1/2 한도), 경계값 포함 규칙(70.0은 안전, 90.0은 HUG 가입 가능), 한계(낙찰가율 지역 편차, 신탁·가압류·당해세 미반영, 다가구 선순위 보증금은 사용자 입력 의존).
 - `0005-ragas-langchain-community-pin.md`: ragas 0.4.3이 `langchain_community.chat_models.vertexai`를 하드 import → community 0.4.x에서 제거됨. 0.3.31 고정으로 해결(langchain 1.3.18과 호환 확인 2026-09-02). 대안: ragas 미사용·자체 LLM-judge 구현(재현성↑, 공인 지표 신뢰↓), 평가 전용 별도 venv(운영 복잡). 결과: langchain-community를 직접 사용하지 않으므로 런타임 영향 없음. ragas 상위 수정 시 핀 해제.
 - `0006-uv-python312-streamlit.md`: uv(lock 재현성·속도), Python 3.12(라이브러리 호환 최광범위, 3.13은 일부 C 확장 미지원), Streamlit(파이썬 단일 스택으로 데모 속도, 대안 FastAPI+React는 포트폴리오 범위 대비 과함).
