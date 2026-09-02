@@ -438,7 +438,8 @@ def _dummy_env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) 
     - .env 파일은 위 RENT_AGENT_ENV_FILE 덕분에 읽히지 않는다.
     - get_settings()의 lru_cache를 매 테스트 전에 비워 테스트 간 오염을 막는다.
     - @pytest.mark.integration 테스트는 실제 키가 필요하므로 더미를 주입하지 않는다
-      (환경변수는 .env보다 우선하므로 더미가 있으면 Settings(_env_file=...)도 더미를 받는다)."""
+      (환경변수는 .env보다 우선하므로 더미가 있으면 Settings(_env_file=...)도 더미를 받는다).
+      통합 테스트는 get_settings() 대신 Settings(_env_file=PROJECT_ROOT / ".env")로 실제 .env를 읽어야 한다."""
     from rent_agent.config import get_settings
 
     get_settings.cache_clear()
@@ -1207,6 +1208,83 @@ def test_parse_empty_items():
     assert records == [] and total == 0
 
 
+def _response(items_xml: str, total: int) -> str:
+    return (
+        "<response><header><resultCode>000</resultCode><resultMsg>OK</resultMsg></header>"
+        f"<body><items>{items_xml}</items><numOfRows>1000</numOfRows><pageNo>1</pageNo>"
+        f"<totalCount>{total}</totalCount></body></response>"
+    )
+
+
+def _item(name: str = "A", day: str = "1", deposit: str = "10,000") -> str:
+    return (
+        f"<item><aptNm>{name}</aptNm><buildYear>2000</buildYear><dealYear>2026</dealYear><dealMonth>7</dealMonth>"
+        f"<dealDay>{day}</dealDay><deposit>{deposit}</deposit><monthlyRent>0</monthlyRent><excluUseAr>59.9</excluUseAr>"
+        "<floor>3</floor><umdNm>역삼동</umdNm></item>"
+    )
+
+
+def test_parse_single_item_dict():
+    # 결과가 1건이면 xmltodict가 list 대신 dict를 준다
+    records, total = parse_rent_xml(_response(_item(), 1), HousingType.APARTMENT)
+    assert total == 1 and len(records) == 1 and records[0].building_name == "A"
+
+
+def test_parse_result_code_error_raises():
+    xml = (
+        "<response><header><resultCode>99</resultCode><resultMsg>LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS</resultMsg>"
+        "</header><body/></response>"
+    )
+    with pytest.raises(MolitApiError, match="resultCode=99"):
+        parse_rent_xml(xml, HousingType.APARTMENT)
+
+
+def test_parse_invalid_date_raises_molit_error():
+    with pytest.raises(MolitApiError, match="거래일"):
+        parse_rent_xml(_response(_item(day=" "), 1), HousingType.APARTMENT)
+
+
+def test_parse_non_xml_raises_molit_error():
+    with pytest.raises(MolitApiError):
+        parse_rent_xml("<html><body>Bad Gateway</body></html>", HousingType.APARTMENT)
+    with pytest.raises(MolitApiError):
+        parse_rent_xml("not xml at all", HousingType.APARTMENT)
+
+
+def test_client_paginates_until_total_count():
+    # 총 3건, 페이지당 2건 → 2페이지 요청. 강남구 아파트는 한 달 1,265건으로 1,000건 상한을 넘는다.
+    pages = {
+        "1": _response(_item("A", "1") + _item("B", "2"), 3),
+        "2": _response(_item("C", "3"), 3),
+    }
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page_no = request.url.params["pageNo"]
+        seen.append(page_no)
+        return httpx.Response(200, text=pages[page_no])
+
+    client = MolitRentClient(ENDPOINTS, service_key="k", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    records = client.fetch("11680", "202607", num_of_rows=2)
+    assert [r.building_name for r in records] == ["A", "B", "C"]
+    assert seen == ["1", "2"]
+
+
+def test_client_stops_on_empty_page_even_if_total_larger():
+    # totalCount가 잘못 크게 와도 빈 페이지에서 멈춘다 (무한 루프 방지)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        body = _response(_item("A"), 999) if calls == 1 else _response("", 999)
+        return httpx.Response(200, text=body)
+
+    client = MolitRentClient(ENDPOINTS, service_key="k", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert len(client.fetch("11680", "202607", num_of_rows=1)) == 1
+    assert calls == 2
+
+
 def test_client_sends_decoded_key_once_and_uses_operation_per_type():
     captured: list[str] = []
 
@@ -1279,8 +1357,10 @@ from typing import Protocol
 
 import httpx
 import xmltodict
+from xml.parsers.expat import ExpatError
 
 FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures"
+MAX_PAGES = 20  # 안전장치: 1,000건 × 20페이지. 서울 자치구 한 달 전월세는 최대 수천 건.
 
 
 class HousingType(StrEnum):
@@ -1342,12 +1422,26 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _to_date(item: dict) -> date:
+    try:
+        return date(_to_int(item.get("dealYear")), _to_int(item.get("dealMonth")), _to_int(item.get("dealDay")))
+    except ValueError as e:
+        raise MolitApiError(
+            f"거래일 필드 오류: {item.get('dealYear')}-{item.get('dealMonth')}-{item.get('dealDay')}"
+        ) from e
+
+
 def parse_rent_xml(xml_text: str, housing_type: HousingType) -> tuple[list[RentRecord], int]:
-    """XML → (레코드 목록, totalCount). 공공데이터포털 공통 에러 포맷은 예외로 변환."""
-    data = xmltodict.parse(xml_text)
+    """XML → (레코드 목록, totalCount). 모든 실패는 MolitApiError로 통일한다."""
+    try:
+        data = xmltodict.parse(xml_text)
+    except ExpatError as e:
+        raise MolitApiError(f"XML 파싱 실패: {e}") from e
     if "OpenAPI_ServiceResponse" in data:
         header = data["OpenAPI_ServiceResponse"].get("cmmMsgHeader", {})
         raise MolitApiError(f"{header.get('errMsg')}: {header.get('returnAuthMsg')}")
+    if "response" not in data:
+        raise MolitApiError(f"알 수 없는 응답 형식: 루트={list(data)[:1]}")
 
     response = data["response"]
     result_code = _clean(response.get("header", {}).get("resultCode"))
@@ -1370,7 +1464,7 @@ def parse_rent_xml(xml_text: str, housing_type: HousingType) -> tuple[list[RentR
             area_m2=_to_float(it.get("excluUseAr")),
             floor=_to_int(it.get("floor")),
             build_year=_to_int(it.get("buildYear")),
-            deal_date=date(_to_int(it.get("dealYear")), _to_int(it.get("dealMonth")), _to_int(it.get("dealDay"))),
+            deal_date=_to_date(it),
             deposit=_to_int(it.get("deposit")),
             monthly_rent=_to_int(it.get("monthlyRent")),
             contract_type=_clean(it.get("contractType")),
@@ -1406,23 +1500,36 @@ class MolitRentClient:
         housing_type: HousingType = HousingType.APARTMENT,
         num_of_rows: int = 1000,
     ) -> list[RentRecord]:
+        """해당 월 전체를 가져온다. totalCount가 numOfRows를 넘으면 페이지를 이어서 요청한다
+        (강남구 아파트 한 달 1,265건처럼 1,000건 상한을 넘는 경우 중위값이 달라지므로 필수)."""
         endpoint = self._endpoints.get(housing_type)
         if not endpoint:
             raise MolitApiError(f"{housing_type.value} 유형의 엔드포인트가 설정되지 않았습니다")
+        url = f"{endpoint}/{HOUSING_SPECS[housing_type].operation}"
+        records: list[RentRecord] = []
+        for page_no in range(1, MAX_PAGES + 1):
+            page, total = self._get_page(url, lawd_cd, deal_ymd, page_no, num_of_rows, housing_type)
+            records.extend(page)
+            if not page or len(records) >= total:
+                break
+        return records
+
+    def _get_page(
+        self, url: str, lawd_cd: str, deal_ymd: str, page_no: int, num_of_rows: int, housing_type: HousingType
+    ) -> tuple[list[RentRecord], int]:
         params = {
             "serviceKey": self._key,
             "LAWD_CD": lawd_cd,
             "DEAL_YMD": deal_ymd,
-            "pageNo": 1,
+            "pageNo": page_no,
             "numOfRows": num_of_rows,
         }
         try:
-            resp = self._http.get(f"{endpoint}/{HOUSING_SPECS[housing_type].operation}", params=params)
+            resp = self._http.get(url, params=params)
             resp.raise_for_status()
         except httpx.HTTPError as e:
             raise MolitApiError(f"HTTP 오류: {e}") from e
-        records, _ = parse_rent_xml(resp.text, housing_type)
-        return records
+        return parse_rent_xml(resp.text, housing_type)
 
 
 class MockMolitRentClient:
@@ -1443,7 +1550,7 @@ class MockMolitRentClient:
 - [ ] **Step 5: 통과 확인**
 
 Run: `uv run pytest tests/tools/test_molit_rent.py -v`
-Expected: 13 passed (parametrize 3건 포함)
+Expected: 20 passed (parametrize 3건 포함)
 
 - [ ] **Step 6: 실제 API 스모크 (수동, 세 유형 각 1회)**
 
