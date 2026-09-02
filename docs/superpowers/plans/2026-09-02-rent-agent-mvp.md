@@ -3984,6 +3984,9 @@ jobs:
 Run: `uv run ruff format . && uv run ruff check . && uv run pytest -q`
 Expected: 포맷 적용, 린트 통과, 유닛 테스트 전부 passed (integration 제외).
 
+- [ ] **Step 1b: 잔여 주석 정리**
+`src/rent_agent/rag/ingest.py`의 `DEFAULT_CHUNK_SIZE` 주석 "가장 긴 섹션(≈950자)" → "가장 긴 섹션(실측 816자, 05 ② 청년전용 버팀목)" (ADR-0002 리뷰에서 실측치와 불일치 지적).
+
 - [ ] **Step 2: README 보강**
 
 `README.md`에 추가:
@@ -3997,7 +4000,7 @@ Expected: 포맷 적용, 린트 통과, 유닛 테스트 전부 passed (integrat
 - [ ] **Step 3: 커밋 & 푸시 & CI 확인**
 
 ```bash
-git add .github README.md
+git add .github README.md pyproject.toml src/rent_agent/rag/ingest.py
 git commit -m "ci: GitHub Actions(ruff+pytest) 및 README 보강
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
