@@ -49,6 +49,8 @@ addopts = "-m 'not integration'"
 line-length = 100
 target-version = "py312"
 src = ["src", "tests", "scripts"]
+# ruff 0.16은 마크다운 코드 펜스도 format --check 대상으로 삼는다. 계획 문서·데이터 원문은 제외.
+extend-exclude = ["docs", "data"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
