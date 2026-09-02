@@ -36,9 +36,7 @@ class HousingSpec:
 
 
 HOUSING_SPECS: dict[HousingType, HousingSpec] = {
-    HousingType.APARTMENT: HousingSpec(
-        "getRTMSDataSvcAptRent", "aptNm", "rent_response.xml"
-    ),
+    HousingType.APARTMENT: HousingSpec("getRTMSDataSvcAptRent", "aptNm", "rent_response.xml"),
     HousingType.MULTI_HOUSE: HousingSpec(
         "getRTMSDataSvcRHRent", "mhouseNm", "rent_response_rh.xml"
     ),

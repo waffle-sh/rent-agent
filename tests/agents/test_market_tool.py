@@ -108,9 +108,7 @@ def test_months_is_clamped_and_errors_are_reported():
     out = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "months": 24}))
     assert len(out["months_queried"]) == 12  # 24 → 12로 클램프
     assert len(client.calls) == 12
-    assert any(
-        e.endswith("08: LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS") for e in out["errors"]
-    )
+    assert any(e.endswith("08: LIMITED NUMBER OF SERVICE REQUESTS EXCEEDS") for e in out["errors"])
     assert out["count"] > 0  # 실패한 달을 제외한 나머지는 요약됨
 
     out0 = json.loads(get_recent_jeonse_deals.invoke({"lawd_cd": "11680", "months": 0}))

@@ -90,9 +90,7 @@ def assess(inp: JeonseInput) -> RiskAssessment:
     required_loan = max(0, inp.deposit - inp.own_capital)
     monthly_interest = required_loan * inp.loan_rate / 100 / 12
     # 비교는 반올림 전 값으로, 표시는 소수 1자리로 (30.04% → 표시 30.0, 경고는 발생)
-    ratio_raw = (
-        monthly_interest / (inp.annual_income / 12) * 100 if inp.annual_income else None
-    )
+    ratio_raw = monthly_interest / (inp.annual_income / 12) * 100 if inp.annual_income else None
     ratio_to_income = round(ratio_raw, 1) if ratio_raw is not None else None
     level = classify(jr, burden, shortfall)
 

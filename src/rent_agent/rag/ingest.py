@@ -92,9 +92,7 @@ def build_vectorstore(
 
 
 def get_embedding(settings: Settings) -> Embeddings:
-    return OpenAIEmbeddings(
-        model=settings.openai_embedding_model, api_key=settings.openai_api_key
-    )
+    return OpenAIEmbeddings(model=settings.openai_embedding_model, api_key=settings.openai_api_key)
 
 
 def ingest(settings: Settings, reset: bool = True) -> int:

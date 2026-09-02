@@ -17,8 +17,10 @@ def _write_docs(tmp_path: Path) -> Path:
     (raw / "law.md").write_text(
         "---\ntitle: 임대차법\nsource: s\ncategory: law\n---\n"
         "# 주택임대차보호법 핵심\n이 문서는 개요입니다.\n"
-        "## 대항력\n" + "주택 인도와 전입신고를 하면 다음 날부터 대항력이 생긴다. " * 30
-        + "\n## 우선변제권\n" + "확정일자를 받으면 우선변제권이 생긴다. " * 30
+        "## 대항력\n"
+        + "주택 인도와 전입신고를 하면 다음 날부터 대항력이 생긴다. " * 30
+        + "\n## 우선변제권\n"
+        + "확정일자를 받으면 우선변제권이 생긴다. " * 30
         + "\n## 출처\n- https://law.go.kr\n",
         encoding="utf-8",
     )
@@ -57,9 +59,7 @@ def test_real_corpus_chunking_is_stable():
     assert 40 <= len(chunks) <= 70
     assert not any(c.metadata["section"].startswith("출처") for c in chunks)
     # 접두("[제목] ")를 뺀 본문이 chunk_size 이내
-    assert all(
-        len(c.page_content) - len(f"[{c.metadata['title']}] ") <= 1000 for c in chunks
-    )
+    assert all(len(c.page_content) - len(f"[{c.metadata['title']}] ") <= 1000 for c in chunks)
     # 섹션 = 청크: 실제 문서의 어떤 ## 섹션도 둘로 갈리지 않아야 한다 (RAGAS Q9 회귀 방지)
     keys = [(c.metadata["file"], c.metadata["section"]) for c in chunks]
     assert len(keys) == len(set(keys)), [k for k in keys if keys.count(k) > 1]

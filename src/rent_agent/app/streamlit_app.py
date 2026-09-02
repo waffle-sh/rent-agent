@@ -10,9 +10,7 @@ from rent_agent.agents import supervisor
 from rent_agent.agents.llm import configure_tracing
 from rent_agent.config import get_settings
 
-st.set_page_config(
-    page_title="rent-agent · 전세 리스크 상담", page_icon="🏠", layout="wide"
-)
+st.set_page_config(page_title="rent-agent · 전세 리스크 상담", page_icon="🏠", layout="wide")
 
 # UI 라벨 → market_agent 도구의 housing_type 값
 HOUSING_LABELS = {
@@ -108,9 +106,7 @@ with tab_diag:
         deposit = c4.number_input(
             "전세 보증금 (만원)", min_value=0, value=30000, step=500, key="deposit"
         )
-        price = c5.number_input(
-            "매매 시세 (만원)", min_value=0, value=50000, step=500, key="price"
-        )
+        price = c5.number_input("매매 시세 (만원)", min_value=0, value=50000, step=500, key="price")
         liens = c6.number_input(
             "선순위 근저당 채권최고액 (만원)", min_value=0, value=0, step=500, key="liens"
         )
@@ -118,9 +114,7 @@ with tab_diag:
         senior_dep = c7.number_input(
             "선순위 임차보증금 (만원, 다가구)", min_value=0, value=0, step=500, key="senior_dep"
         )
-        capital = c8.number_input(
-            "자기자금 (만원)", min_value=0, value=0, step=500, key="capital"
-        )
+        capital = c8.number_input("자기자금 (만원)", min_value=0, value=0, step=500, key="capital")
         income = c9.number_input(
             "연소득 (만원, 선택)", min_value=0, value=0, step=100, key="income"
         )
