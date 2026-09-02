@@ -1,4 +1,11 @@
-"""청킹 + Chroma 적재. 임베딩을 주입받아 테스트에서는 Fake, 운영에서는 OpenAI를 쓴다."""
+"""청킹 + Chroma 적재. 임베딩을 주입받아 테스트에서는 Fake, 운영에서는 OpenAI를 쓴다.
+
+청킹 전략(근거는 계획 Task 8 "설계 근거"):
+1) MarkdownHeaderTextSplitter로 `#`/`##` 섹션 단위로 먼저 나눈다 — 서문과 첫 조문이 병합되지 않도록.
+2) `## 출처` 섹션은 제외한다 — URL 목록은 검색 노이즈이고 source는 메타데이터에 있다.
+3) chunk_size를 넘는 섹션만 문자 기준으로 추가 분할한다.
+4) 모든 청크 앞에 "[문서 제목] "을 붙인다 — 맥락이 약한 헤더 청크도 어느 문서인지 알 수 있게.
+"""
 
 from pathlib import Path
 
@@ -6,27 +13,54 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from rent_agent.config import Settings
 from rent_agent.rag.loader import load_markdown_docs
 
-# 마크다운 헤더 → 빈 줄 → 줄 → 문장 순으로 자른다. 조문/항목 경계를 우선 존중.
-SEPARATORS = ["\n## ", "\n### ", "\n\n", "\n", ". ", " ", ""]
+HEADERS = [("#", "h1"), ("##", "section")]
+EXCLUDED_SECTION_PREFIXES = ("출처",)
+FALLBACK_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
 
 
 def split_documents(
     docs: list[Document], chunk_size: int = 800, chunk_overlap: int = 100
 ) -> list[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=SEPARATORS
+    header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=HEADERS, strip_headers=False)
+    char_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=FALLBACK_SEPARATORS
     )
-    chunks = splitter.split_documents(docs)
-    # 청크 앞에 "[문서 제목] "을 붙인다. "## 보증금액 한도"처럼 맥락이 약한 헤더 청크도
-    # 어떤 문서(HUG 보증/버팀목 대출 등)의 내용인지 임베딩과 LLM이 알 수 있게 하기 위함.
-    for c in chunks:
-        c.page_content = f"[{c.metadata.get('title', '')}] {c.page_content}"
+    chunks: list[Document] = []
+    for doc in docs:
+        for sec in header_splitter.split_text(doc.page_content):
+            section = str(sec.metadata.get("section", ""))
+            if section.startswith(EXCLUDED_SECTION_PREFIXES):
+                continue
+            meta = {**doc.metadata, "section": section}
+            pieces = (
+                [sec]
+                if len(sec.page_content) <= chunk_size
+                else char_splitter.split_documents([sec])
+            )
+            for piece in pieces:
+                chunks.append(
+                    Document(
+                        page_content=f"[{meta['title']}] {piece.page_content.strip()}",
+                        metadata=meta,
+                    )
+                )
     return chunks
+
+
+def chunk_ids(chunks: list[Document]) -> list[str]:
+    """파일명#순번. 같은 문서를 다시 적재하면 같은 id → Chroma upsert로 중복 없음."""
+    counters: dict[str, int] = {}
+    ids = []
+    for c in chunks:
+        f = c.metadata["file"]
+        counters[f] = counters.get(f, 0) + 1
+        ids.append(f"{f}#{counters[f]}")
+    return ids
 
 
 def build_vectorstore(
@@ -34,19 +68,18 @@ def build_vectorstore(
 ) -> Chroma:
     chroma_dir.mkdir(parents=True, exist_ok=True)
     if reset:
-        # 계획의 shutil.rmtree 대신 컬렉션만 비운다(Step 5 대안).
-        # 같은 경로에 이미 열린 chromadb 클라이언트가 있는 상태에서 디렉터리를 지우면
-        # "attempt to write a readonly database"로 실패한다.
-        existing = Chroma(
+        # 디렉터리를 지우는 대신 컬렉션만 비운다. 같은 경로를 이미 연 chromadb 클라이언트가 있으면
+        # rmtree 후 쓰기에서 "attempt to write a readonly database"(code 1032)가 나기 때문.
+        Chroma(
             collection_name=collection,
             embedding_function=embedding,
             persist_directory=str(chroma_dir),
-        )
-        existing.reset_collection()
+        ).reset_collection()
     chunks = split_documents(load_markdown_docs(raw_dir))
     return Chroma.from_documents(
         documents=chunks,
         embedding=embedding,
+        ids=chunk_ids(chunks),
         collection_name=collection,
         persist_directory=str(chroma_dir),
     )

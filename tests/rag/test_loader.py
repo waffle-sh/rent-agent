@@ -27,3 +27,9 @@ def test_load_missing_frontmatter_uses_filename(tmp_path: Path):
     docs = load_markdown_docs(tmp_path)
     assert docs[0].metadata["title"] == "b"
     assert docs[0].metadata["source"] == ""
+
+
+def test_null_frontmatter_value_becomes_empty_string(tmp_path: Path):
+    (tmp_path / "c.md").write_text("---\ntitle: 문서\nsource:\n---\n본문", encoding="utf-8")
+    docs = load_markdown_docs(tmp_path)
+    assert docs[0].metadata["source"] == ""  # "None" 문자열이 되면 안 됨
