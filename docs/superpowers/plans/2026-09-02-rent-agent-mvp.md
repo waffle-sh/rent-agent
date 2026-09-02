@@ -431,14 +431,18 @@ os.environ["RENT_AGENT_ENV_FILE"] = str(Path(__file__).parent / "does-not-exist.
 
 
 @pytest.fixture(autouse=True)
-def _dummy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _dummy_env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """유닛 테스트는 실제 키 없이 돌아야 한다.
     - 필수 키는 더미로 채운다.
     - .env 파일은 위 RENT_AGENT_ENV_FILE 덕분에 읽히지 않는다.
-    - get_settings()의 lru_cache를 매 테스트 전에 비워 테스트 간 오염을 막는다."""
+    - get_settings()의 lru_cache를 매 테스트 전에 비워 테스트 간 오염을 막는다.
+    - @pytest.mark.integration 테스트는 실제 키가 필요하므로 더미를 주입하지 않는다
+      (환경변수는 .env보다 우선하므로 더미가 있으면 Settings(_env_file=...)도 더미를 받는다)."""
     from rent_agent.config import get_settings
 
     get_settings.cache_clear()
+    if request.node.get_closest_marker("integration"):
+        return
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setenv("APARTMENT_OPENAPI_KEY", "test%2Bkey%3D%3D")
     monkeypatch.setenv("LANGSMITH_TRACING", "false")
@@ -1064,6 +1068,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Create: `src/rent_agent/tools/molit_rent.py`, `tests/fixtures/rent_response.xml`, `tests/fixtures/rent_response_rh.xml`, `tests/fixtures/rent_response_offi.xml`, `tests/fixtures/rent_error.xml`
 - Test: `tests/tools/test_molit_rent.py`, `tests/tools/test_lawd_code_live.py` (Task 4에 정의된 통합 테스트 — 여기서 파일 생성)
+- Modify: `tests/conftest.py` — `integration` 마커 테스트에는 더미 키를 주입하지 않도록 (Task 2의 conftest 코드가 이미 이 버전으로 갱신됨; 그 코드로 교체)
 
 **배경 (2026-09-02 실측):** 국토부 전월세 실거래가 API는 주거 유형별로 서비스가 나뉜다. 세 API 모두 같은 서비스 키, 같은 파라미터(`LAWD_CD`, `DEAL_YMD`, `pageNo`, `numOfRows`), 같은 XML 골격을 쓰고 **건물명 필드만 다르다**. 사회초년생 임차 수요는 빌라·오피스텔이 많아 세 유형을 모두 지원한다.
 
@@ -1461,7 +1466,7 @@ Expected: 50 passed (전 법정동코드가 실거래 데이터를 반환).
 - [ ] **Step 7: 커밋**
 
 ```bash
-git add src/rent_agent/tools/molit_rent.py tests/tools/test_molit_rent.py tests/tools/test_lawd_code_live.py tests/fixtures
+git add src/rent_agent/tools/molit_rent.py tests/tools/test_molit_rent.py tests/tools/test_lawd_code_live.py tests/fixtures tests/conftest.py
 git commit -m "feat: 국토부 전월세 실거래가 클라이언트 (아파트·연립다세대·오피스텔) 및 XML 파서
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -2560,10 +2565,8 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-def real_settings(monkeypatch):
-    for k in ("OPENAI_API_KEY", "APARTMENT_OPENAPI_KEY", "MOLIT_USE_MOCK", "LANGSMITH_TRACING"):
-        monkeypatch.delenv(k, raising=False)
-    # conftest는 .env를 차단하므로 통합 테스트만 실제 .env를 명시적으로 읽는다
+def real_settings():
+    # conftest는 .env를 차단하므로 통합 테스트만 실제 .env를 명시적으로 읽는다 (integration 마커 → 더미 미주입)
     s = Settings(_env_file=PROJECT_ROOT / ".env")
     configure_tracing(s)
     if not s.openai_api_key or s.openai_api_key.startswith("sk-test"):
